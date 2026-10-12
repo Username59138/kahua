@@ -1,5 +1,6 @@
 //! Turning a DOM into a list of drawable parts, plus picking and bounds.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use glam::{Mat3, Mat4, Quat, Vec3};
@@ -8,7 +9,8 @@ use kahua_io::rbx_dom_weak::types::{CFrame, Matrix3, Ref, Variant, Vector3};
 use kahua_io::rbx_dom_weak::{Instance, Ustr, WeakDom};
 use kahua_io::reflect;
 
-use crate::assets::{AssetStore, LoadedImage, LoadedMesh, mesh_scale};
+use crate::assets::{AssetState, AssetStore, LoadedImage, LoadedMesh, mesh_scale};
+use crate::roblox;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Shape {
@@ -183,6 +185,7 @@ pub fn is_renderable(inst: &Instance) -> bool {
 
 fn extract_parts(dom: &WeakDom, mut assets: Option<&mut AssetStore>) -> Scene {
     let mut scene = Scene::default();
+    let mut warnings = Warnings::default();
     for inst in dom.descendants_of(world_root(dom)) {
         if !is_renderable(inst) {
             continue;
@@ -208,22 +211,32 @@ fn extract_parts(dom: &WeakDom, mut assets: Option<&mut AssetStore>) -> Scene {
         let mut mesh = None;
         if inst.class == "MeshPart"
             && let Some(store) = assets.as_deref_mut()
-            && let Some((loaded, scale)) = mesh_for_part(inst, size, store, &mut scene.warnings)
+            && let Some((loaded, scale)) = mesh_for_part(inst, size, store, &mut warnings)
         {
             mesh = Some(loaded);
             mesh_scale = scale;
         }
+        if inst.class == "UnionOperation"
+            && let Some(union) = union_for_part(inst, assets.as_deref_mut(), &mut warnings)
+        {
+            mesh = Some(MeshRef { mesh: union, texture: None });
+            mesh_scale = Vec3::ONE;
+        }
         let [r, g, b] = part_color_srgb(inst);
+        // A NegateOperation is the cutting shape of a union. It is drawn faint so it can still be picked.
+        let ghost = if inst.class == "NegateOperation" { 0.25 } else { 1.0 };
+        let alpha = (1.0 - transparency.clamp(0.0, 1.0)) * ghost;
         scene.parts.push(ScenePart {
             owner: inst.referent(),
             shape,
             transform: cframe_to_mat4(&cf),
             size,
             mesh_scale,
-            color: [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0 - transparency.clamp(0.0, 1.0)],
+            color: [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), alpha],
             mesh,
         });
     }
+    scene.warnings = warnings.list;
     scene
 }
 
@@ -236,35 +249,111 @@ fn content_value(inst: &Instance, name: &str) -> Option<String> {
     }
 }
 
-/// The first of `names` that holds a local (`kahua://`) URI.
-fn local_uri(inst: &Instance, names: &[&str]) -> Option<String> {
-    names.iter().filter_map(|n| content_value(inst, n)).find(|u| asset_uri::relative_path(u).is_some())
+/// The first of `names` that holds a URI this crate can load: a `kahua://`
+/// project file or a Roblox asset.
+fn loadable_uri(inst: &Instance, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| content_value(inst, n))
+        .find(|u| asset_uri::relative_path(u).is_some() || roblox::asset_id(u).is_some())
 }
 
-/// Loads the mesh and texture of a MeshPart that refers to a local file, and
-/// the scale that fits the mesh to the part's Size. Returns `None` (the part is
-/// drawn as a box) when the mesh is not local or cannot be loaded.
+/// Warnings for one scene. A broken asset used by many parts is reported once.
+#[derive(Default)]
+struct Warnings {
+    list: Vec<String>,
+    keys: HashSet<String>,
+}
+
+impl Warnings {
+    /// Adds the warning for `key` (an asset URI) unless one was already added.
+    fn once(&mut self, key: &str, message: impl FnOnce() -> String) {
+        if self.keys.insert(key.to_owned()) {
+            self.list.push(message());
+        }
+    }
+}
+
+/// The union data stored inline in a UnionOperation's MeshData, if any.
+fn mesh_data(inst: &Instance) -> Option<Vec<u8>> {
+    let bytes = match prop(inst, "MeshData")? {
+        Variant::SharedString(s) => s.data().to_vec(),
+        Variant::BinaryString(b) => AsRef::<[u8]>::as_ref(b).to_vec(),
+        _ => return None,
+    };
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+/// The geometry of a UnionOperation: its MeshData, or else the union data
+/// downloaded from its AssetId. Union geometry is stored relative to the part's
+/// CFrame, so it is used as it is, not scaled to Size. Returns `None` (the part is
+/// drawn as a box) while the data is downloading or when it cannot be read.
+fn union_for_part(
+    inst: &Instance,
+    mut assets: Option<&mut AssetStore>,
+    warnings: &mut Warnings,
+) -> Option<Arc<LoadedMesh>> {
+    let mut inline_error = None;
+    if let Some(bytes) = mesh_data(inst) {
+        let decoded = match assets.as_deref_mut() {
+            Some(store) => store.inline_union(&bytes),
+            None => roblox::load_union_mesh(&bytes).map(Arc::new),
+        };
+        match decoded {
+            Ok(mesh) => return Some(mesh),
+            Err(e) => inline_error = Some(format!("{e:#}")),
+        }
+    }
+    match (content_value(inst, "AssetId"), assets) {
+        (Some(uri), Some(store)) => match store.union_state(&uri) {
+            AssetState::Ready(mesh) => Some(mesh),
+            AssetState::Pending | AssetState::Unavailable => None,
+            AssetState::Failed(e) => {
+                warnings.once(&uri, || format!("{}: {e}", inst.name));
+                None
+            }
+        },
+        _ => {
+            if let Some(e) = inline_error {
+                warnings.once(&format!("MeshData of {}", inst.name), || format!("{}: {e}", inst.name));
+            }
+            None
+        }
+    }
+}
+
+/// Loads the mesh and texture of a MeshPart that refers to a project file or a
+/// Roblox asset, and the scale that fits the mesh to the part's Size. Returns
+/// `None` (the part is drawn as a box) while an asset is downloading, when it is
+/// not available, or when the mesh cannot be loaded.
 fn mesh_for_part(
     inst: &Instance,
     size: Vec3,
     assets: &mut AssetStore,
-    warnings: &mut Vec<String>,
+    warnings: &mut Warnings,
 ) -> Option<(MeshRef, Vec3)> {
-    let mesh_uri = local_uri(inst, &["MeshContent", "MeshId"])?;
-    let mesh = match assets.mesh(&mesh_uri) {
-        Ok(mesh) => mesh,
-        Err(e) => {
-            warnings.push(format!("{}: {e:#}", inst.name));
+    let mesh_uri = loadable_uri(inst, &["MeshContent", "MeshId"])?;
+    let mesh = match assets.mesh_state(&mesh_uri) {
+        AssetState::Ready(mesh) => mesh,
+        AssetState::Pending | AssetState::Unavailable => return None,
+        AssetState::Failed(e) => {
+            warnings.once(&mesh_uri, || format!("{}: {e}", inst.name));
             return None;
         }
     };
-    let texture = local_uri(inst, &["TextureContent", "TextureID"]).and_then(|uri| match assets.image(&uri) {
-        Ok(image) => Some(image),
-        Err(e) => {
-            warnings.push(format!("{}: {e:#}", inst.name));
-            None
-        }
-    });
+    let texture = match loadable_uri(inst, &["TextureContent", "TextureID"]) {
+        None => None,
+        Some(uri) => match assets.image_state(&uri) {
+            AssetState::Ready(image) => Some(image),
+            // The part waits for its texture too, so it is never drawn half loaded.
+            AssetState::Pending => return None,
+            AssetState::Unavailable => None,
+            AssetState::Failed(e) => {
+                warnings.once(&uri, || format!("{}: {e}", inst.name));
+                None
+            }
+        },
+    };
     // InitialSize is the size the mesh was authored at; without it, the file's own size.
     let initial = match prop(inst, "InitialSize") {
         Some(Variant::Vector3(v)) if v.x > 0.0 && v.y > 0.0 && v.z > 0.0 => Vec3::new(v.x, v.y, v.z),
@@ -439,5 +528,127 @@ mod tests {
         let (_, r2, p2) = m.to_scale_rotation_translation();
         assert!(r2.abs_diff_eq(rot, 1e-5) || r2.abs_diff_eq(-rot, 1e-5));
         assert!(p2.abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), 1e-5));
+    }
+
+    fn identity_cframe(x: f32) -> CFrame {
+        let row = |i: usize| {
+            let mut v = [0.0; 3];
+            v[i] = 1.0;
+            Vector3::new(v[0], v[1], v[2])
+        };
+        CFrame::new(Vector3::new(x, 0.0, 0.0), Matrix3::new(row(0), row(1), row(2)))
+    }
+
+    #[test]
+    fn downloaded_roblox_meshes_replace_the_box_once_they_arrive() {
+        use crate::assets::fixtures::{counting_downloader, quad_mesh_bytes, wait_for_poll};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut dom = kahua_io::template::empty();
+        let workspace = kahua_io::template::workspace(&dom);
+        let part = kahua_io::template::mesh_part(
+            "Remote",
+            "rbxassetid://777",
+            Vector3::new(4.0, 4.0, 0.0),
+            Vector3::new(0.0, 0.0, 0.0),
+        )
+        .with_property("Size", Vector3::new(4.0, 4.0, 1.0));
+        dom.insert(workspace, part);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut store = AssetStore::new(project.path()).with_cache_dir(cache.path());
+        store.set_downloader(counting_downloader(quad_mesh_bytes(), calls.clone()));
+
+        let first = Scene::extract_with_assets(&dom, &mut store);
+        assert!(first.parts[0].mesh.is_none(), "a box while the mesh downloads");
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+
+        wait_for_poll(&mut store);
+        let second = Scene::extract_with_assets(&dom, &mut store);
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+        let mesh = second.parts[0].mesh.as_ref().expect("the downloaded mesh");
+        assert!(mesh.mesh.native_size.abs_diff_eq(Vec3::new(2.0, 2.0, 0.0), 1e-5));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn union_geometry_comes_from_mesh_data_and_is_not_centered() {
+        use crate::roblox::test_data::union_square_bytes;
+        use kahua_io::rbx_dom_weak::InstanceBuilder;
+
+        let mut dom = kahua_io::template::empty();
+        let workspace = kahua_io::template::workspace(&dom);
+        let union = InstanceBuilder::new("UnionOperation")
+            .with_name("Union")
+            .with_property("CFrame", identity_cframe(0.0))
+            .with_property("MeshData", Variant::BinaryString(union_square_bytes().into()));
+        dom.insert(workspace, union);
+        let negate =
+            InstanceBuilder::new("NegateOperation").with_name("Cut").with_property("CFrame", identity_cframe(20.0));
+        dom.insert(workspace, negate);
+
+        let scene = Scene::extract(&dom);
+        let name = |p: &ScenePart| dom.get_by_ref(p.owner).unwrap().name.clone();
+        let union_part = scene.parts.iter().find(|p| name(p) == "Union").unwrap();
+        let mesh = union_part.mesh.as_ref().expect("union geometry");
+        assert!(union_part.mesh_scale.abs_diff_eq(Vec3::ONE, 1e-6));
+        // The square sits at x = 8..12 in the union's own space; it is not moved to the origin.
+        assert!(mesh.mesh.primitives[0].vertices.iter().all(|v| v.position[0] > 7.0));
+
+        let cut = scene.parts.iter().find(|p| name(p) == "Cut").unwrap();
+        assert!(cut.mesh.is_none());
+        assert!(cut.color[3] < 0.5, "negate operations are faint, got {}", cut.color[3]);
+    }
+
+    #[test]
+    fn union_geometry_is_downloaded_from_its_asset_id() {
+        use crate::assets::fixtures::{counting_downloader, wait_for_poll};
+        use crate::roblox::test_data::union_square_bytes;
+        use kahua_io::rbx_dom_weak::InstanceBuilder;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut dom = kahua_io::template::empty();
+        let workspace = kahua_io::template::workspace(&dom);
+        let union = InstanceBuilder::new("UnionOperation")
+            .with_name("Union")
+            .with_property("CFrame", identity_cframe(0.0))
+            .with_property("AssetId", Variant::Content("rbxassetid://4500696697".to_owned().into()));
+        dom.insert(workspace, union);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut store = AssetStore::new(project.path()).with_cache_dir(cache.path());
+        store.set_downloader(counting_downloader(union_square_bytes(), calls));
+        assert!(Scene::extract_with_assets(&dom, &mut store).parts[0].mesh.is_none());
+        wait_for_poll(&mut store);
+        let scene = Scene::extract_with_assets(&dom, &mut store);
+        assert!(scene.parts[0].mesh.is_some(), "the downloaded union is drawn");
+        assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+    }
+
+    #[test]
+    fn a_broken_asset_is_reported_once_per_scene() {
+        let project = tempfile::tempdir().unwrap();
+        let mut dom = kahua_io::template::empty();
+        let workspace = kahua_io::template::workspace(&dom);
+        for name in ["First", "Second"] {
+            let part = kahua_io::template::mesh_part(
+                name,
+                "kahua://assets/meshes/gone.obj",
+                Vector3::new(1.0, 1.0, 1.0),
+                Vector3::new(0.0, 0.0, 0.0),
+            );
+            dom.insert(workspace, part);
+        }
+        let mut store = AssetStore::new(project.path());
+        let scene = Scene::extract_with_assets(&dom, &mut store);
+        assert_eq!(scene.parts.len(), 2);
+        assert_eq!(scene.warnings.len(), 1, "{:?}", scene.warnings);
+        assert!(scene.warnings[0].contains("First"));
     }
 }

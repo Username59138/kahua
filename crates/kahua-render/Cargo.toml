@@ -10,12 +10,14 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
+binrw = "0.15.2"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 glam = "0.34.1"
 gltf = "1.4.1"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 kahua-io = { version = "0.1.0", path = "../kahua-io" }
 pollster = { version = "1.0.1", default-features = false }
+rbx_mesh = { version = "0.8.1", default-features = false, features = ["mesh", "mesh-v1", "union-graphics"] }
 tobj = "4.0.5"
 wgpu = "30"
 

@@ -5,9 +5,10 @@ pub mod camera;
 pub mod headless;
 pub mod mesh;
 pub mod renderer;
+pub mod roblox;
 pub mod scene;
 
-pub use assets::{AssetStore, ImportedMesh, LoadedImage, LoadedMesh, import_mesh};
+pub use assets::{AssetState, AssetStore, Downloader, ImportedMesh, LoadedImage, LoadedMesh, import_mesh};
 pub use camera::Camera;
 pub use glam;
 pub use headless::{Headless, default_camera};

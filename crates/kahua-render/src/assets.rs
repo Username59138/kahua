@@ -1,11 +1,16 @@
-//! Meshes and textures stored in a project, loaded from glTF/GLB, OBJ and
-//! image files. Parts refer to them with `kahua://` URIs (see `kahua_io::assets`).
+//! Meshes and textures stored in a project, loaded from glTF/GLB, OBJ, Roblox
+//! mesh and image files. Parts refer to project files with `kahua://` URIs (see
+//! `kahua_io::assets`) and to Roblox assets with `rbxassetid://` URIs or
+//! roblox.com asset links. Roblox assets are downloaded in the background
+//! through a downloader the caller provides, and cached on disk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +20,7 @@ use image::imageops::{self, FilterType};
 use kahua_io::assets as uri;
 
 use crate::mesh::Vertex;
+use crate::roblox::{self, Content};
 
 /// Largest width or height of a texture that is uploaded to the GPU. Bigger
 /// images are scaled down when they are loaded.
@@ -81,7 +87,9 @@ pub struct LoadedMesh {
 }
 
 impl LoadedMesh {
-    fn from_primitives(primitives: Vec<MeshPrimitive>) -> Result<Self> {
+    /// Builds a mesh from its primitives. With `recenter`, positions are moved so
+    /// the bounding box is centered on the origin.
+    pub(crate) fn from_primitives(primitives: Vec<MeshPrimitive>, recenter: bool) -> Result<Self> {
         let primitives: Vec<MeshPrimitive> = primitives.into_iter().filter(|p| !p.indices.is_empty()).collect();
         let mut min = Vec3::splat(f32::INFINITY);
         let mut max = Vec3::splat(f32::NEG_INFINITY);
@@ -93,21 +101,55 @@ impl LoadedMesh {
         if !min.is_finite() || !max.is_finite() {
             bail!("the mesh has no triangles");
         }
-        let center = (min + max) * 0.5;
         let mut primitives = primitives;
-        for v in primitives.iter_mut().flat_map(|p| p.vertices.iter_mut()) {
-            v.position = (Vec3::from(v.position) - center).to_array();
+        if recenter {
+            let center = (min + max) * 0.5;
+            for v in primitives.iter_mut().flat_map(|p| p.vertices.iter_mut()) {
+                v.position = (Vec3::from(v.position) - center).to_array();
+            }
         }
         Ok(Self { primitives, native_size: max - min })
     }
 }
 
+/// Largest number of Roblox asset downloads running at once.
+pub const MAX_DOWNLOADS: usize = 4;
+
+/// The function that fetches a Roblox asset's bytes by its ID. It runs on a
+/// background thread, so it may block.
+pub type Downloader = Arc<dyn Fn(u64) -> Result<Vec<u8>> + Send + Sync>;
+
+type DownloadFn = dyn Fn(u64) -> Result<Vec<u8>> + Send + Sync;
+
+/// Whether an asset can be drawn now.
+#[derive(Debug)]
+pub enum AssetState<T> {
+    Ready(Arc<T>),
+    /// Being downloaded in the background. `AssetStore::poll` returns true when it finishes.
+    Pending,
+    /// Not cached and no downloader is set, so it will never load. Parts using
+    /// it are drawn as boxes without a warning.
+    Unavailable,
+    /// Could not be loaded. The message says why.
+    Failed(String),
+}
+
 /// Loads and caches meshes and images from a project folder. Each file is read
-/// again when its modification time changes.
+/// again when its modification time changes. Roblox assets are downloaded in the
+/// background (see `set_downloader`) and cached on disk.
 pub struct AssetStore {
     root: PathBuf,
     meshes: HashMap<PathBuf, Cached<LoadedMesh>>,
     images: HashMap<PathBuf, Cached<LoadedImage>>,
+    cache_dir: PathBuf,
+    downloader: Option<Downloader>,
+    remote: HashMap<(u64, RemoteKind), Slot>,
+    queue: VecDeque<(u64, RemoteKind)>,
+    running: usize,
+    /// Union geometry stored inline in a part, decoded once per distinct data.
+    inline_unions: HashMap<u64, Arc<LoadedMesh>>,
+    done_tx: Sender<Done>,
+    done_rx: Receiver<Done>,
 }
 
 struct Cached<T> {
@@ -115,18 +157,180 @@ struct Cached<T> {
     value: Arc<T>,
 }
 
+/// What a Roblox asset is used as. The same asset ID can be read as different kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RemoteKind {
+    Mesh,
+    Image,
+    Union,
+}
+
+#[derive(Clone)]
+enum Decoded {
+    Mesh(Arc<LoadedMesh>),
+    Image(Arc<LoadedImage>),
+}
+
+#[derive(Clone)]
+enum Slot {
+    Pending,
+    Ready(Decoded),
+    Failed(String),
+}
+
+/// Outcome of a remote lookup, before it becomes an `AssetState`.
+enum Status {
+    Ready(Decoded),
+    Pending,
+    Unavailable,
+    Failed(String),
+}
+
+struct Done {
+    key: (u64, RemoteKind),
+    result: std::result::Result<Decoded, String>,
+}
+
 impl AssetStore {
     /// A store that resolves `kahua://` URIs against `root`, the project directory.
+    /// Downloaded Roblox assets are cached in `<root>/.kahua/cache/assets`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), meshes: HashMap::new(), images: HashMap::new() }
+        let root = root.into();
+        let cache_dir = root.join(".kahua").join("cache").join("assets");
+        let (done_tx, done_rx) = mpsc::channel();
+        Self {
+            root,
+            meshes: HashMap::new(),
+            images: HashMap::new(),
+            cache_dir,
+            downloader: None,
+            remote: HashMap::new(),
+            queue: VecDeque::new(),
+            running: 0,
+            inline_unions: HashMap::new(),
+            done_tx,
+            done_rx,
+        }
+    }
+
+    /// Stores downloaded Roblox assets in `dir` instead of the default cache folder.
+    pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = dir.into();
+        self
+    }
+
+    /// Sets the function that downloads Roblox assets. Without one, only assets
+    /// already in the cache can load.
+    pub fn set_downloader(&mut self, downloader: Arc<dyn Fn(u64) -> anyhow::Result<Vec<u8>> + Send + Sync>) {
+        self.downloader = Some(downloader);
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// The mesh at a `kahua://` URI.
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// The mesh at a URI. A Roblox asset that is still downloading gives an error
+    /// until `poll` reports it finished. Never waits for the network.
     pub fn mesh(&mut self, mesh_uri: &str) -> Result<Arc<LoadedMesh>> {
+        match self.mesh_state(mesh_uri) {
+            AssetState::Ready(mesh) => Ok(mesh),
+            AssetState::Pending => bail!("{mesh_uri} is still downloading"),
+            AssetState::Unavailable => bail!("{mesh_uri} is not cached and no downloader is set"),
+            AssetState::Failed(e) => bail!("{e}"),
+        }
+    }
+
+    /// The image at a URI, as for `mesh`.
+    pub fn image(&mut self, image_uri: &str) -> Result<Arc<LoadedImage>> {
+        match self.image_state(image_uri) {
+            AssetState::Ready(image) => Ok(image),
+            AssetState::Pending => bail!("{image_uri} is still downloading"),
+            AssetState::Unavailable => bail!("{image_uri} is not cached and no downloader is set"),
+            AssetState::Failed(e) => bail!("{e}"),
+        }
+    }
+
+    /// Whether the mesh at a URI can be drawn now. The first request for a
+    /// Roblox asset starts its download.
+    pub fn mesh_state(&mut self, mesh_uri: &str) -> AssetState<LoadedMesh> {
+        match roblox::asset_id(mesh_uri) {
+            Some(id) => match self.remote_status(id, RemoteKind::Mesh) {
+                Status::Ready(Decoded::Mesh(mesh)) => AssetState::Ready(mesh),
+                Status::Ready(Decoded::Image(_)) => AssetState::Failed(format!("{mesh_uri} is not a mesh")),
+                other => other.into_state(),
+            },
+            None => match self.load_local_mesh(mesh_uri) {
+                Ok(mesh) => AssetState::Ready(mesh),
+                Err(e) => AssetState::Failed(format!("{e:#}")),
+            },
+        }
+    }
+
+    /// Whether the image at a URI can be drawn now, as for `mesh_state`.
+    pub fn image_state(&mut self, image_uri: &str) -> AssetState<LoadedImage> {
+        match roblox::asset_id(image_uri) {
+            Some(id) => match self.remote_status(id, RemoteKind::Image) {
+                Status::Ready(Decoded::Image(image)) => AssetState::Ready(image),
+                Status::Ready(Decoded::Mesh(_)) => AssetState::Failed(format!("{image_uri} is not an image")),
+                other => other.into_state(),
+            },
+            None => match self.load_local_image(image_uri) {
+                Ok(image) => AssetState::Ready(image),
+                Err(e) => AssetState::Failed(format!("{e:#}")),
+            },
+        }
+    }
+
+    /// The geometry of union data downloaded from a UnionOperation's AssetId.
+    /// The first request starts the download, as for `mesh_state`.
+    pub fn union_state(&mut self, union_uri: &str) -> AssetState<LoadedMesh> {
+        match roblox::asset_id(union_uri) {
+            Some(id) => match self.remote_status(id, RemoteKind::Union) {
+                Status::Ready(Decoded::Mesh(mesh)) => AssetState::Ready(mesh),
+                Status::Ready(Decoded::Image(_)) => AssetState::Failed(format!("{union_uri} is not union data")),
+                other => other.into_state(),
+            },
+            None => AssetState::Failed(format!("{union_uri} is not a Roblox asset URI")),
+        }
+    }
+
+    /// Collects the downloads that finished since the last call and starts queued
+    /// ones. Returns true if any asset finished, loaded or failed, so the caller
+    /// should extract the scene again.
+    pub fn poll(&mut self) -> bool {
+        let mut finished = false;
+        while let Ok(done) = self.done_rx.try_recv() {
+            self.running = self.running.saturating_sub(1);
+            let slot = match done.result {
+                Ok(decoded) => Slot::Ready(decoded),
+                Err(message) => Slot::Failed(message),
+            };
+            self.remote.insert(done.key, slot);
+            finished = true;
+        }
+        self.start_jobs();
+        finished
+    }
+
+    /// Union geometry stored inline in a part (its MeshData). Identical data is
+    /// decoded once and shared.
+    pub(crate) fn inline_union(&mut self, bytes: &[u8]) -> Result<Arc<LoadedMesh>> {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some(mesh) = self.inline_unions.get(&key) {
+            return Ok(mesh.clone());
+        }
+        let mesh = Arc::new(roblox::load_union_mesh(bytes)?);
+        self.inline_unions.insert(key, mesh.clone());
+        Ok(mesh)
+    }
+
+    fn load_local_mesh(&mut self, mesh_uri: &str) -> Result<Arc<LoadedMesh>> {
         let path = uri::resolve(&self.root, mesh_uri)?;
         let modified = modified_time(&path)?;
         if let Some(cached) = self.meshes.get(&path)
@@ -139,8 +343,7 @@ impl AssetStore {
         Ok(mesh)
     }
 
-    /// The image at a `kahua://` URI.
-    pub fn image(&mut self, image_uri: &str) -> Result<Arc<LoadedImage>> {
+    fn load_local_image(&mut self, image_uri: &str) -> Result<Arc<LoadedImage>> {
         let path = uri::resolve(&self.root, image_uri)?;
         let modified = modified_time(&path)?;
         if let Some(cached) = self.images.get(&path)
@@ -151,6 +354,117 @@ impl AssetStore {
         let image = Arc::new(load_image_file(&path).with_context(|| format!("failed to load {image_uri}"))?);
         self.images.insert(path, Cached { modified, value: image.clone() });
         Ok(image)
+    }
+
+    /// The state of a Roblox asset used as `kind`. The first request queues a
+    /// background job, unless the asset is neither cached nor downloadable.
+    fn remote_status(&mut self, id: u64, kind: RemoteKind) -> Status {
+        match self.remote.get(&(id, kind)) {
+            Some(Slot::Ready(decoded)) => return Status::Ready(decoded.clone()),
+            Some(Slot::Failed(message)) => return Status::Failed(message.clone()),
+            Some(Slot::Pending) => return Status::Pending,
+            None => {}
+        }
+        if self.downloader.is_none() && !self.cache_path(id).is_file() {
+            return Status::Unavailable;
+        }
+        self.remote.insert((id, kind), Slot::Pending);
+        self.queue.push_back((id, kind));
+        self.start_jobs();
+        Status::Pending
+    }
+
+    fn cache_path(&self, id: u64) -> PathBuf {
+        self.cache_dir.join(id.to_string())
+    }
+
+    fn start_jobs(&mut self) {
+        while self.running < MAX_DOWNLOADS {
+            let Some(key) = self.queue.pop_front() else { break };
+            self.running += 1;
+            let job = Job {
+                key,
+                cache: self.cache_path(key.0),
+                downloader: self.downloader.clone(),
+                done: self.done_tx.clone(),
+            };
+            std::thread::spawn(move || job.run());
+        }
+    }
+}
+
+impl Status {
+    fn into_state<T>(self) -> AssetState<T> {
+        match self {
+            // Callers match Ready themselves; the kind of a job always matches its request.
+            Status::Ready(_) => AssetState::Failed("internal error: asset kind mismatch".to_owned()),
+            Status::Pending => AssetState::Pending,
+            Status::Unavailable => AssetState::Unavailable,
+            Status::Failed(message) => AssetState::Failed(message),
+        }
+    }
+}
+
+/// One background download and decode.
+struct Job {
+    key: (u64, RemoteKind),
+    cache: PathBuf,
+    downloader: Option<Downloader>,
+    done: Sender<Done>,
+}
+
+impl Job {
+    fn run(self) {
+        let (id, kind) = self.key;
+        let result =
+            fetch(id, kind, &self.cache, self.downloader.as_deref()).map_err(|e| format!("rbxassetid://{id}: {e:#}"));
+        // The store may have been dropped; then nobody wants the result.
+        let _ = self.done.send(Done { key: self.key, result });
+    }
+}
+
+/// Reads an asset from the cache, or else downloads it. Only bytes that decode
+/// are cached, so a cached file is always a valid mesh, image or union, and a
+/// kind mismatch is reported without downloading the asset again.
+fn fetch(id: u64, kind: RemoteKind, cache: &Path, downloader: Option<&DownloadFn>) -> Result<Decoded> {
+    if let Ok(bytes) = fs::read(cache) {
+        return decode(kind, &bytes);
+    }
+    let Some(download) = downloader else {
+        bail!("not cached and no downloader is set");
+    };
+    let bytes = download(id).context("download failed")?;
+    let decoded = decode(kind, &bytes)?;
+    write_cache(cache, &bytes);
+    Ok(decoded)
+}
+
+/// Decodes asset bytes as `kind`. The content decides what the bytes are, so a
+/// PNG requested as a mesh is reported as an image.
+fn decode(kind: RemoteKind, bytes: &[u8]) -> Result<Decoded> {
+    match (kind, roblox::sniff(bytes)) {
+        (RemoteKind::Mesh, Content::Mesh) => Ok(Decoded::Mesh(Arc::new(roblox::load_roblox_mesh(bytes)?))),
+        (RemoteKind::Mesh, Content::Image) => bail!("it is an image, not a mesh"),
+        (RemoteKind::Image, Content::Image) => {
+            let image = image::load_from_memory(bytes).context("failed to decode the image")?;
+            Ok(Decoded::Image(Arc::new(LoadedImage::from_rgba(image.to_rgba8()))))
+        }
+        (RemoteKind::Image, Content::Mesh) => bail!("it is a mesh, not an image"),
+        (RemoteKind::Union, _) => Ok(Decoded::Mesh(Arc::new(roblox::load_union_mesh(bytes)?))),
+        (_, Content::Other) => bail!("unrecognized content (not a Roblox mesh, PNG or JPEG)"),
+    }
+}
+
+/// Writes a cached asset through a temporary file, so a reader never sees half
+/// of it. A cache that cannot be written only costs a download next time.
+fn write_cache(path: &Path, bytes: &[u8]) {
+    let Some(dir) = path.parent() else { return };
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if fs::write(&tmp, bytes).is_ok() {
+        let _ = fs::rename(&tmp, path);
     }
 }
 
@@ -176,7 +490,11 @@ pub fn load_mesh_file(path: &Path) -> Result<LoadedMesh> {
     match ext.as_str() {
         "glb" | "gltf" => load_gltf(path),
         "obj" => load_obj(path),
-        other => bail!("unsupported mesh format {:?} (use .glb, .gltf or .obj)", other),
+        "mesh" => {
+            let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+            roblox::load_roblox_mesh(&bytes).with_context(|| format!("failed to read {}", path.display()))
+        }
+        other => bail!("unsupported mesh format {:?} (use .glb, .gltf, .obj or .mesh)", other),
     }
 }
 
@@ -292,7 +610,7 @@ fn load_gltf(path: &Path) -> Result<LoadedMesh> {
             primitives.push(MeshPrimitive { vertices, indices, texture });
         }
     }
-    LoadedMesh::from_primitives(primitives)
+    LoadedMesh::from_primitives(primitives, true)
 }
 
 /// Converts a decoded glTF image to RGBA8. Grayscale and 16-bit images are
@@ -352,7 +670,7 @@ fn load_obj(path: &Path) -> Result<LoadedMesh> {
         let (vertices, indices) = build_primitive(&positions, normals.as_deref(), uvs.as_deref(), &mesh.indices)?;
         primitives.push(MeshPrimitive { vertices, indices, texture: None });
     }
-    LoadedMesh::from_primitives(primitives)
+    LoadedMesh::from_primitives(primitives, true)
 }
 
 // -- shared -------------------------------------------------------------------
@@ -360,7 +678,7 @@ fn load_obj(path: &Path) -> Result<LoadedMesh> {
 /// Turns positions, optional normals and UVs with a triangle index list into
 /// renderable vertices. Without usable normals, every triangle gets its face
 /// normal, so its vertices are not shared.
-fn build_primitive(
+pub(crate) fn build_primitive(
     positions: &[[f32; 3]],
     normals: Option<&[[f32; 3]]>,
     uvs: Option<&[[f32; 2]]>,
@@ -401,9 +719,13 @@ pub(crate) mod fixtures {
 
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::Engine;
     use image::{ImageFormat, Rgba, RgbaImage};
+
+    use super::AssetStore;
 
     /// A 2x2 quad in the XY plane facing +Z, as OBJ text without normals.
     pub const QUAD_OBJ: &str =
@@ -458,6 +780,31 @@ pub(crate) mod fixtures {
         let path = dir.join(name);
         std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
         path
+    }
+
+    /// A 4x4 square in the XY plane as a version 2.00 Roblox mesh.
+    pub fn quad_mesh_bytes() -> Vec<u8> {
+        crate::roblox::test_data::square_mesh_bytes()
+    }
+
+    /// A downloader that counts its calls and returns `bytes` for any ID.
+    pub fn counting_downloader(
+        bytes: Vec<u8>,
+        calls: Arc<AtomicUsize>,
+    ) -> Arc<dyn Fn(u64) -> anyhow::Result<Vec<u8>> + Send + Sync> {
+        Arc::new(move |_id| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(bytes.clone())
+        })
+    }
+
+    /// Polls until a download finishes, so the test can read its result.
+    pub fn wait_for_poll(store: &mut AssetStore) {
+        let start = std::time::Instant::now();
+        while !store.poll() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(20), "download never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 
@@ -600,5 +947,180 @@ mod tests {
         assert!(imported.size.abs_diff_eq(Vec3::new(2.0, 2.0, 0.0), 1e-5));
         assert!(project.path().join("assets/meshes/sword.obj").is_file());
         assert!(import_mesh(project.path(), &src.path().join("sword.txt")).is_err());
+    }
+
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use image::ImageFormat;
+
+    use super::fixtures::{counting_downloader, quad_mesh_bytes, wait_for_poll};
+
+    fn downloader_of(bytes: Vec<u8>) -> (Arc<AtomicUsize>, Downloader) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let downloader = counting_downloader(bytes, calls.clone());
+        (calls, downloader)
+    }
+
+    #[test]
+    fn roblox_meshes_download_in_the_background_and_then_load() {
+        let project = project_with(&[]);
+        let cache = tempfile::tempdir().unwrap();
+        let (calls, downloader) = downloader_of(quad_mesh_bytes());
+        let mut store = AssetStore::new(project.path()).with_cache_dir(cache.path());
+        store.set_downloader(downloader);
+
+        assert!(!store.poll(), "nothing has finished yet");
+        assert!(matches!(store.mesh_state("rbxassetid://123"), AssetState::Pending));
+        // Asking again does not start a second download.
+        assert!(matches!(store.mesh_state("rbxassetid://123"), AssetState::Pending));
+        assert!(store.mesh("rbxassetid://123").is_err(), "still downloading");
+
+        wait_for_poll(&mut store);
+        let AssetState::Ready(mesh) = store.mesh_state("rbxassetid://123") else { panic!("expected a loaded mesh") };
+        assert!(mesh.native_size.abs_diff_eq(Vec3::new(2.0, 2.0, 0.0), 1e-5));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(cache.path().join("123").is_file(), "the download is cached");
+        assert!(store.mesh("https://www.roblox.com/asset/?id=123").is_ok(), "URL forms share the cache entry");
+    }
+
+    #[test]
+    fn cached_downloads_are_not_downloaded_again() {
+        let cache = tempfile::tempdir().unwrap();
+        let (calls, downloader) = downloader_of(quad_mesh_bytes());
+        let mut first = AssetStore::new(project_with(&[]).path()).with_cache_dir(cache.path());
+        first.set_downloader(downloader);
+        assert!(matches!(first.mesh_state("rbxassetid://55"), AssetState::Pending));
+        wait_for_poll(&mut first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A new store on the same cache loads it with no downloader at all.
+        let mut second = AssetStore::new(project_with(&[]).path()).with_cache_dir(cache.path());
+        assert!(matches!(second.mesh_state("rbxassetid://55"), AssetState::Pending));
+        wait_for_poll(&mut second);
+        assert!(matches!(second.mesh_state("rbxassetid://55"), AssetState::Ready(_)));
+
+        // And with a downloader set, the cache still wins.
+        let (calls_again, downloader) = downloader_of(quad_mesh_bytes());
+        second.set_downloader(downloader);
+        assert!(matches!(second.mesh_state("rbxassetid://55"), AssetState::Ready(_)));
+        assert_eq!(calls_again.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn without_a_downloader_or_cache_roblox_assets_are_unavailable() {
+        let project = project_with(&[]);
+        let cache = tempfile::tempdir().unwrap();
+        let mut store = AssetStore::new(project.path()).with_cache_dir(cache.path());
+        assert!(matches!(store.mesh_state("rbxassetid://9"), AssetState::Unavailable));
+        assert!(matches!(store.image_state("rbxassetid://9"), AssetState::Unavailable));
+        assert!(store.mesh("rbxassetid://9").is_err());
+        assert!(!store.poll());
+    }
+
+    #[test]
+    fn at_most_four_downloads_run_at_once() {
+        let cache = tempfile::tempdir().unwrap();
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (r, p) = (running.clone(), peak.clone());
+        let bytes = quad_mesh_bytes();
+        let downloader: Arc<dyn Fn(u64) -> Result<Vec<u8>> + Send + Sync> = Arc::new(move |_id| {
+            let now = r.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            r.fetch_sub(1, Ordering::SeqCst);
+            Ok(bytes.clone())
+        });
+        let mut store = AssetStore::new(project_with(&[]).path()).with_cache_dir(cache.path());
+        store.set_downloader(downloader);
+        for id in 1..=10 {
+            assert!(matches!(store.mesh_state(&format!("rbxassetid://{id}")), AssetState::Pending));
+        }
+        let all_ready = |store: &mut AssetStore| {
+            (1..=10).all(|id| matches!(store.mesh_state(&format!("rbxassetid://{id}")), AssetState::Ready(_)))
+        };
+        let start = std::time::Instant::now();
+        while !all_ready(&mut store) {
+            store.poll();
+            assert!(start.elapsed() < std::time::Duration::from_secs(30), "downloads did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(peak.load(Ordering::SeqCst) <= MAX_DOWNLOADS, "peak {}", peak.load(Ordering::SeqCst));
+        assert!(peak.load(Ordering::SeqCst) >= 2, "downloads do run in parallel");
+    }
+
+    #[test]
+    fn a_failed_download_is_reported_and_not_retried() {
+        let cache = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let downloader: Arc<dyn Fn(u64) -> Result<Vec<u8>> + Send + Sync> = Arc::new(move |_id| {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(b"<html>Not Found</html>".to_vec())
+        });
+        let mut store = AssetStore::new(project_with(&[]).path()).with_cache_dir(cache.path());
+        store.set_downloader(downloader);
+        assert!(matches!(store.mesh_state("rbxassetid://77"), AssetState::Pending));
+        wait_for_poll(&mut store);
+        let AssetState::Failed(message) = store.mesh_state("rbxassetid://77") else { panic!("expected a failure") };
+        assert!(message.contains("rbxassetid://77") && message.contains("unrecognized"), "{message}");
+        assert!(matches!(store.mesh_state("rbxassetid://77"), AssetState::Failed(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!cache.path().join("77").exists(), "bad data is not cached");
+    }
+
+    #[test]
+    fn downloaded_images_load_and_kinds_are_checked_by_content() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut png = Vec::new();
+        RgbaImage::from_pixel(3, 2, Rgba([9, 8, 7, 255]))
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .unwrap();
+        let (_, downloader) = downloader_of(png);
+        let mut store = AssetStore::new(project_with(&[]).path()).with_cache_dir(cache.path());
+        store.set_downloader(downloader);
+        assert!(matches!(store.image_state("rbxassetid://31"), AssetState::Pending));
+        wait_for_poll(&mut store);
+        let AssetState::Ready(image) = store.image_state("rbxassetid://31") else { panic!("expected an image") };
+        assert_eq!((image.width, image.height), (3, 2));
+        // The same asset read as a mesh fails by its content, without downloading again.
+        assert!(matches!(store.mesh_state("rbxassetid://31"), AssetState::Pending));
+        wait_for_poll(&mut store);
+        let AssetState::Failed(message) = store.mesh_state("rbxassetid://31") else { panic!("a PNG is not a mesh") };
+        assert!(message.contains("image"), "{message}");
+    }
+
+    #[test]
+    fn remote_meshes_are_checked_by_content() {
+        let cache = tempfile::tempdir().unwrap();
+        let (_, downloader) = downloader_of(quad_mesh_bytes());
+        let mut store = AssetStore::new(project_with(&[]).path()).with_cache_dir(cache.path());
+        store.set_downloader(downloader);
+        assert!(matches!(store.image_state("rbxassetid://41"), AssetState::Pending));
+        wait_for_poll(&mut store);
+        let AssetState::Failed(message) = store.image_state("rbxassetid://41") else {
+            panic!("a mesh is not an image")
+        };
+        assert!(message.contains("mesh"), "{message}");
+    }
+
+    #[test]
+    fn poll_reports_only_new_results() {
+        let cache = tempfile::tempdir().unwrap();
+        let (_, downloader) = downloader_of(quad_mesh_bytes());
+        let mut store = AssetStore::new(project_with(&[]).path()).with_cache_dir(cache.path());
+        store.set_downloader(downloader);
+        assert!(!store.poll());
+        store.mesh_state("rbxassetid://5");
+        wait_for_poll(&mut store);
+        assert!(!store.poll(), "the finished download was reported once");
+    }
+
+    #[test]
+    fn roblox_uris_are_not_files() {
+        let project = project_with(&[]);
+        let mut store = AssetStore::new(project.path());
+        assert!(matches!(store.union_state("kahua://x.obj"), AssetState::Failed(_)));
     }
 }

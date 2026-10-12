@@ -175,4 +175,57 @@ mod tests {
         let [r, g, b, _] = image.get_pixel(64, 64).0;
         assert!(g > 90 && g > 2 * r && g > 2 * b, "center should be the green texture, got {:?}", [r, g, b]);
     }
+
+    #[test]
+    fn downloaded_roblox_mesh_renders_after_it_arrives() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::assets::{AssetState, fixtures};
+
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        // A red 2x2 square facing the camera, served by a fake downloader.
+        let mut dom = kahua_io::template::empty();
+        let workspace = kahua_io::template::workspace(&dom);
+        let part = kahua_io::template::mesh_part(
+            "Remote",
+            "rbxassetid://4242",
+            Vector3::new(2.0, 2.0, 0.0),
+            Vector3::new(0.0, 0.0, 0.0),
+        )
+        .with_property("Size", Vector3::new(4.0, 4.0, 1.0))
+        .with_property("Color", Color3::new(0.0, 0.0, 1.0));
+        dom.insert(workspace, part);
+
+        let mut headless = match Headless::new() {
+            Ok(headless) => headless,
+            Err(e) => {
+                eprintln!("skipping downloaded mesh render test: {e:#}");
+                return;
+            }
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut assets = AssetStore::new(project.path()).with_cache_dir(cache.path());
+        assets.set_downloader(fixtures::counting_downloader(
+            crate::roblox::test_data::square_mesh_bytes(),
+            calls.clone(),
+        ));
+        let mut camera = Camera::default();
+        camera.look_at(glam::Vec3::new(0.0, 0.0, 6.0), glam::Vec3::ZERO);
+
+        // Before the download finishes the part is a blue box, which is not the mesh.
+        let before = Scene::extract_with_assets(&dom, &mut assets);
+        assert!(before.parts[0].mesh.is_none());
+        assert!(matches!(assets.mesh_state("rbxassetid://4242"), AssetState::Pending));
+        fixtures::wait_for_poll(&mut assets);
+
+        let scene = Scene::extract_with_assets(&dom, &mut assets);
+        assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+        assert!(scene.parts[0].mesh.is_some());
+        let image = headless.render(&scene, &camera, &Overlay::default(), 128, 128).unwrap();
+        let [r, g, b, _] = image.get_pixel(64, 64).0;
+        assert!(b > 90 && b > 2 * r && b > 2 * g, "the blue part should be drawn, got {:?}", [r, g, b]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }
