@@ -50,6 +50,8 @@ icons! {
     Shapes => "shapes",
     Pointer => "mouse-pointer-2",
     Move => "move",
+    Scale => "scale-3d",
+    Rotate => "rotate-3d",
     Circle => "circle",
     Cylinder => "cylinder",
     Wedge => "triangle-right",

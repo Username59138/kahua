@@ -4,7 +4,7 @@ use kahua_core::kahua_io::rbx_dom_weak::types::{CFrame, Color3, Enum, Ref, Varia
 use kahua_core::kahua_io::rbx_dom_weak::{Ustr, WeakDom};
 use kahua_core::kahua_io::reflect;
 use kahua_core::{Document, Edit, Snapshot};
-use kahua_render::glam::{Quat, Vec3};
+use kahua_render::glam::{Mat4, Quat, Vec3};
 use kahua_render::scene::{self, cframe_to_mat4, mat4_to_cframe, world_root};
 use kahua_render::{Camera, Scene};
 
@@ -82,13 +82,57 @@ pub fn rotate_selection(
 ) {
     let Some((min, max)) = selection_bounds(doc, scene, index) else { return };
     let center = (min + max) * 0.5;
-    let rot = Quat::from_axis_angle(axis, std::f32::consts::FRAC_PI_2);
-    transform_selection(doc, label, |cf| {
-        let m = cframe_to_mat4(&cf);
-        let (_, r, p) = m.to_scale_rotation_translation();
-        let new = kahua_render::glam::Mat4::from_rotation_translation(rot * r, center + rot * (p - center));
-        snap_rotation(mat4_to_cframe(&new))
-    });
+    transform_selection(doc, label, |cf| rotate_cframe_about(cf, center, axis, std::f32::consts::FRAC_PI_2));
+}
+
+/// Turns a CFrame by `angle` radians around the world-space `axis` (unit length)
+/// passing through `center`. The position orbits the center and the orientation turns with it.
+pub fn rotate_cframe_about(cf: CFrame, center: Vec3, axis: Vec3, angle: f32) -> CFrame {
+    let turn = Quat::from_axis_angle(axis, angle);
+    let (_, rot, pos) = cframe_to_mat4(&cf).to_scale_rotation_translation();
+    let new = Mat4::from_rotation_translation(turn * rot, center + turn * (pos - center));
+    snap_rotation(mat4_to_cframe(&new))
+}
+
+/// The smallest Size a part can be dragged to, in studs.
+pub const MIN_PART_SIZE: f32 = 0.05;
+
+/// The new length and center of a box after one of its faces moved `outward` studs
+/// along the unit vector `dir`. The opposite face stays in place, unless `symmetric`:
+/// then both faces move and the center stays. `snap` rounds the new length.
+pub fn resize_along(
+    center: Vec3,
+    dir: Vec3,
+    size: f32,
+    outward: f32,
+    symmetric: bool,
+    snap: Option<f32>,
+) -> (f32, Vec3) {
+    let raw = if symmetric { size + 2.0 * outward } else { size + outward };
+    let snapped = match snap {
+        Some(step) => (raw / step).round() * step,
+        None => raw,
+    };
+    let new = snapped.max(MIN_PART_SIZE);
+    let new_center = if symmetric { center } else { center + dir * (new - size) * 0.5 };
+    (new, new_center)
+}
+
+/// Ctrl+A: selects every direct child of the world root that is not locked.
+pub fn select_all(doc: &mut Document) {
+    let world = world_root(&doc.dom);
+    let Some(inst) = doc.dom.get_by_ref(world) else { return };
+    let selection = inst
+        .children()
+        .iter()
+        .copied()
+        .filter(|r| {
+            doc.dom
+                .get_by_ref(*r)
+                .is_some_and(|child| !matches!(scene::prop(child, "Locked"), Some(Variant::Bool(true))))
+        })
+        .collect();
+    doc.selection = selection;
 }
 
 /// Cleans up floating point noise in rotation matrices after 90° turns.
@@ -311,4 +355,64 @@ pub fn click_target(dom: &WeakDom, part: Ref, select_part: bool) -> Ref {
         current = inst.parent();
     }
     target
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kahua_core::kahua_io::rbx_dom_weak::types::Matrix3;
+
+    fn cf_at(p: Vec3) -> CFrame {
+        CFrame::new(Vector3::new(p.x, p.y, p.z), Matrix3::identity())
+    }
+
+    fn pos(cf: &CFrame) -> Vec3 {
+        Vec3::new(cf.position.x, cf.position.y, cf.position.z)
+    }
+
+    #[test]
+    fn rotating_about_an_axis_orbits_the_center() {
+        // A quarter turn about +Y maps +X to -Z.
+        let turned =
+            rotate_cframe_about(cf_at(Vec3::new(2.0, 0.0, 0.0)), Vec3::ZERO, Vec3::Y, std::f32::consts::FRAC_PI_2);
+        assert!(pos(&turned).abs_diff_eq(Vec3::new(0.0, 0.0, -2.0), 1e-5));
+
+        // Around an off-origin center the same quarter turn orbits that point instead.
+        let turned =
+            rotate_cframe_about(cf_at(Vec3::new(2.0, 0.0, 0.0)), Vec3::X, Vec3::Y, std::f32::consts::FRAC_PI_2);
+        assert!(pos(&turned).abs_diff_eq(Vec3::new(1.0, 0.0, -1.0), 1e-5));
+    }
+
+    #[test]
+    fn rotating_turns_the_orientation_too() {
+        let turned = rotate_cframe_about(cf_at(Vec3::ZERO), Vec3::ZERO, Vec3::Y, std::f32::consts::FRAC_PI_2);
+        let x_axis = kahua_render::scene::cframe_to_mat4(&turned).x_axis.truncate();
+        assert!(x_axis.abs_diff_eq(Vec3::new(0.0, 0.0, -1.0), 1e-5));
+    }
+
+    #[test]
+    fn resizing_keeps_the_opposite_face_in_place() {
+        // Pushing the +X face out by one stud on a 4 stud part keeps the -X face at -2.
+        let (size, center) = resize_along(Vec3::ZERO, Vec3::X, 4.0, 1.0, false, None);
+        assert!((size - 5.0).abs() < 1e-6);
+        assert!(center.abs_diff_eq(Vec3::new(0.5, 0.0, 0.0), 1e-6));
+        let minus_x_face = center - Vec3::X * size * 0.5;
+        assert!((minus_x_face.x + 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn symmetric_resizing_keeps_the_center() {
+        let (size, center) = resize_along(Vec3::new(1.0, 2.0, 3.0), Vec3::X, 4.0, 1.0, true, None);
+        assert!((size - 6.0).abs() < 1e-6);
+        assert!(center.abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), 1e-6));
+    }
+
+    #[test]
+    fn resizing_snaps_and_clamps() {
+        let (size, _) = resize_along(Vec3::ZERO, Vec3::X, 4.0, 0.3, false, Some(1.0));
+        assert!((size - 4.0).abs() < 1e-6);
+        let (size, center) = resize_along(Vec3::ZERO, Vec3::X, 1.0, -5.0, false, None);
+        assert!((size - MIN_PART_SIZE).abs() < 1e-6);
+        assert!((center.x - (MIN_PART_SIZE - 1.0) * 0.5).abs() < 1e-6);
+    }
 }
