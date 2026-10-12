@@ -1,5 +1,6 @@
 //! File formats for Kahua: Roblox places/models and Rojo-compatible projects.
 
+pub mod asset_lock;
 pub mod assets;
 pub mod config;
 pub mod json_format;
@@ -7,6 +8,7 @@ pub mod json_props;
 pub mod names;
 pub mod place;
 pub mod project;
+pub mod publish;
 pub mod reflect;
 pub mod template;
 

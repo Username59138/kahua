@@ -53,6 +53,9 @@ enum Command {
     },
 
     /// Write a project or file out as .rbxl, .rbxlx, .rbxm or .rbxmx.
+    ///
+    /// A project with an assets.lock is written with rbxassetid:// URIs for its
+    /// uploaded assets, as publish sends it.
     Build {
         /// Project directory or place file (defaults to the current directory).
         #[arg(default_value = ".")]
@@ -60,6 +63,9 @@ enum Command {
         /// Output file; the extension picks the format.
         #[arg(short, long)]
         output: PathBuf,
+        /// Keep kahua:// URIs instead of replacing them with rbxassetid:// URIs.
+        #[arg(long)]
+        local_uris: bool,
     },
 
     /// Show the instance tree of a project or file.
@@ -145,9 +151,18 @@ fn run(cli: Cli) -> Result<()> {
             println!("Imported {} into {}", file.display(), dir.display());
             Ok(())
         }
-        Some(Command::Build { input, output }) => {
+        Some(Command::Build { input, output, local_uris }) => {
             let doc = open(&input)?;
-            doc.export(&output)?;
+            let project_dir = doc.path();
+            let has_lock = project_dir.is_dir() && kahua_io::asset_lock::AssetLock::path(project_dir).is_file();
+            if has_lock && !local_uris {
+                let lock = kahua_io::asset_lock::AssetLock::read(project_dir)?;
+                let (dom, warnings) = kahua_io::publish::resolve_for_roblox(&doc.dom, &lock, project_dir)?;
+                print_warnings(&warnings);
+                kahua_io::place::write_file(&dom, &output)?;
+            } else {
+                doc.export(&output)?;
+            }
             println!("Wrote {}", output.display());
             Ok(())
         }
