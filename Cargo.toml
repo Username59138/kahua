@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Username59138/kahua"
+rust-version = "1.95"
+
+[profile.dev.package."*"]
+# Dependencies (wgpu, egui, image) are much faster with optimizations.
+opt-level = 2
+
+[profile.release]
+lto = "thin"

@@ -1,0 +1,20 @@
+[package]
+name = "kahua"
+description = "Open source editor for Roblox places: GUI, CLI and headless rendering"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+kahua-core = { version = "0.1.0", path = "../kahua-core" }
+kahua-gui = { version = "0.1.0", path = "../kahua-gui", optional = true }
+kahua-io = { version = "0.1.0", path = "../kahua-io" }
+kahua-render = { version = "0.1.0", path = "../kahua-render" }
+
+[features]
+default = ["gui"]
+gui = ["dep:kahua-gui"]

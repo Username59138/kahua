@@ -1,0 +1,13 @@
+[package]
+name = "kahua-core"
+description = "Kahua editing model: documents, selection and undo history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+kahua-io = { version = "0.1.0", path = "../kahua-io" }

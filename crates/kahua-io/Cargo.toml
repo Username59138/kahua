@@ -1,0 +1,25 @@
+[package]
+name = "kahua-io"
+description = "Kahua file formats: Roblox places and Rojo-compatible projects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+rbx_binary = "3.0.1"
+rbx_dom_weak = "4.2.0"
+rbx_reflection = "7"
+rbx_reflection_database = "3.0.1"
+rbx_types = { version = "3.1.0", features = ["serde"] }
+rbx_xml = "3.0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+toml = "1.1.8"
+
+[dev-dependencies]
+serde_json = "1.0.154"
+tempfile = "3.27.0"
