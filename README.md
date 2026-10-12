@@ -23,8 +23,12 @@ It also runs headless: render screenshots of a place from the command line or in
   vectors, colors, enums, text, plus Position and Orientation like Studio. Multi-selection edits.
 - **3D viewport** for parts (block, ball, cylinder, wedge, corner wedge), colors and
   transparency, Studio-style camera (right mouse to look, WASD/QE to fly, wheel to zoom, F to focus),
-  click to select, and a move tool with grid snapping.
-- **Script editor** with Luau syntax highlighting and line numbers.
+  click or box select, and Move, Scale and Rotate tools with grid and angle snapping, world or
+  local axes, and dragging parts across surfaces.
+- **MeshParts from files in your project** (`.glb`, `.gltf`, `.obj`) with their textures, no
+  account needed: Insert → Mesh from File, or `kahua add-mesh`.
+- **Script editor** with Luau syntax highlighting, find and replace, go to line, auto-indent,
+  block indent/unindent, comment toggling and bracket matching.
 - **Undo/redo** for everything.
 - **CLI and headless rendering** that need no display or GPU.
 
@@ -62,6 +66,7 @@ kahua build my-game -o my-game.rbxl     # project -> place file (also .rbxlx/.rb
 kahua info place.rbxl --depth 3         # print the instance tree
 kahua render my-game -o shot.png        # screenshot without a window
 kahua render place.rbxl --focus Workspace.Car --width 1920 --height 1080
+kahua add-mesh my-game sword.glb --position 0,5,0   # copy a mesh into the project
 ```
 
 ### Editor shortcuts
@@ -70,7 +75,9 @@ kahua render place.rbxl --focus Workspace.Car --width 1920 --height 1080
 | --- | --- |
 | Look around / fly | Right mouse drag, WASD, Q/E (Shift = slower) |
 | Zoom / focus selection | Mouse wheel / F |
-| Select tool / Move tool | Ctrl+1 / Ctrl+2 |
+| Select / Move / Scale / Rotate | Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4 |
+| World or local axes | Ctrl+L |
+| Select all | Ctrl+A |
 | Select a part inside a model | Alt+click |
 | Undo / Redo | Ctrl+Z / Ctrl+Y |
 | Duplicate / Delete / Rename | Ctrl+D / Del / F2 |
@@ -78,6 +85,8 @@ kahua render place.rbxl --focus Workspace.Car --width 1920 --height 1080
 | Group / Ungroup | Ctrl+G / Ctrl+U |
 | Rotate / Tilt 90° | Ctrl+R / Ctrl+T |
 | Save | Ctrl+S |
+| Script: find / replace / go to line | Ctrl+F / Ctrl+H / Ctrl+G |
+| Script: indent / unindent / comment | Tab / Shift+Tab / Ctrl+/ |
 
 ## Project format
 
@@ -101,6 +110,8 @@ my-game/
 
 - Scripts are plain `.luau` files. Instances that contain scripts become folders.
 - Everything else is a readable `.model.json`, so map changes show up as small git diffs.
+- Meshes and textures live in `assets/` and are referenced as `kahua://assets/meshes/sword.glb`.
+  Publishing (planned) will upload them and record the Roblox asset IDs.
 - Instances that reference each other (welds, `PrimaryPart`) or hold binary data are stored as
   `.rbxm` so nothing is lost.
 - Existing Rojo projects keep their own layout: Kahua writes changes back where they came from
@@ -118,8 +129,8 @@ my-game/
 
 ## Roadmap
 
-- MeshParts, unions and textures (downloading assets needs an optional account login)
-- Rotate and scale tools, surface snapping
+- Decals and textures on part faces; downloading meshes of existing places (needs an optional login)
+- Properties grouped by category, Attributes and Tags, dockable panels
 - Luau autocompletion and type checking via luau-lsp
 - Optional login to publish places (internal Studio endpoints or Open Cloud)
 - Terrain, GUI editing, a minimal playtest mode

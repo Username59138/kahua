@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText, Ui};
-use kahua_core::kahua_io::rbx_dom_weak::types::Ref;
+use kahua_core::kahua_io::rbx_dom_weak::types::{CFrame, Content, Matrix3, Ref, Vector3};
 use kahua_core::{Document, Snapshot, Source};
-use kahua_render::Scene;
 use kahua_render::glam::Vec3;
 use kahua_render::scene::world_root;
+use kahua_render::{AssetStore, Scene};
 
 use crate::config::AppConfig;
 use crate::explorer::{Explorer, ExplorerAction};
@@ -43,6 +43,9 @@ pub struct Editor {
     clipboard: Vec<Snapshot>,
     scene: Scene,
     index: HashMap<Ref, usize>,
+    /// Meshes and textures stored in the project (`kahua://` URIs).
+    assets: AssetStore,
+    reported_warnings: std::collections::HashSet<String>,
     scene_revision: Option<u64>,
     show_output: bool,
     save_as: Option<SaveAsDialog>,
@@ -77,6 +80,7 @@ const CLOSE_TAB: KeyboardShortcut = shortcut(CMD, Key::W);
 
 impl Editor {
     pub fn new(doc: Document) -> Self {
+        let assets = AssetStore::new(asset_root(&doc));
         Self {
             doc,
             viewport: Viewport::default(),
@@ -88,6 +92,8 @@ impl Editor {
             clipboard: Vec::new(),
             scene: Scene::default(),
             index: HashMap::new(),
+            assets,
+            reported_warnings: Default::default(),
             scene_revision: None,
             show_output: true,
             save_as: None,
@@ -114,7 +120,7 @@ impl Editor {
         if self.scene_revision == Some(self.doc.revision()) {
             return false;
         }
-        self.scene = Scene::extract(&self.doc.dom);
+        self.scene = Scene::extract_with_assets(&self.doc.dom, &mut self.assets);
         self.index = self.scene.parts.iter().enumerate().map(|(i, p)| (p.owner, i)).collect();
         self.scene_revision = Some(self.doc.revision());
         true
@@ -157,6 +163,11 @@ impl Editor {
     ) -> Option<EditorAction> {
         let mut action = None;
         let scene_changed = self.refresh_scene();
+        for warning in &self.scene.warnings {
+            if self.reported_warnings.insert(warning.clone()) {
+                log.warn(warning.clone());
+            }
+        }
         self.shortcuts(ui, config, log);
         self.tabs.retain(|r| self.doc.dom.get_by_ref(*r).is_some());
         if self.active_tab.is_some_and(|r| !self.tabs.contains(&r)) {
@@ -457,6 +468,11 @@ impl Editor {
             }
         });
         ui.menu_button("Insert", |ui| {
+            if ui.add(icons::button(Icon::Cube, "Mesh from File…")).clicked() {
+                self.insert_mesh(log);
+                ui.close();
+            }
+            ui.separator();
             for (label, kind) in [
                 ("Block", PartKind::Block),
                 ("Sphere", PartKind::Sphere),
@@ -498,6 +514,41 @@ impl Editor {
             }
         });
         action
+    }
+
+    /// Copies a mesh file into the project and inserts a MeshPart in front of the camera.
+    fn insert_mesh(&mut self, log: &mut Log) {
+        let Some(file) = rfd::FileDialog::new().add_filter("3D model", &["glb", "gltf", "obj"]).pick_file() else {
+            return;
+        };
+        let root = asset_root(&self.doc);
+        match kahua_render::import_mesh(&root, &file) {
+            Ok(imported) => {
+                let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Mesh".into());
+                let size = imported.size;
+                let camera = &self.viewport.camera;
+                let (origin, dir) = (camera.position, camera.forward());
+                let p = match self.scene.pick(origin, dir) {
+                    Some((_, t)) if t < 500.0 => origin + dir * t + Vec3::Y * size.y * 0.5,
+                    _ => origin + dir * 20.0,
+                };
+                let v = |v: Vec3| Vector3::new(v.x, v.y, v.z);
+                let snapshot = Snapshot::new("MeshPart", &name)
+                    .with_property("Anchored", true)
+                    .with_property("MeshContent", Content::from_uri(imported.uri.clone()))
+                    .with_property("InitialSize", v(size))
+                    .with_property("Size", v(size))
+                    .with_property("CFrame", CFrame::new(v(p), Matrix3::identity()));
+                let r = snapshot.referent;
+                let edit = self.doc.create(world_root(&self.doc.dom), snapshot);
+                self.doc.perform("Insert Mesh", vec![edit]);
+                self.doc.selection = vec![r];
+                self.explorer.reveal(r);
+                self.active_tab = None;
+                log.info(format!("Added {} as {}", file.display(), imported.uri));
+            }
+            Err(e) => log.error(format!("Could not import {}: {e:#}", file.display())),
+        }
     }
 
     fn insert_part(&mut self, kind: PartKind, config: &AppConfig) {
@@ -691,4 +742,11 @@ impl Editor {
             }
         }
     }
+}
+
+/// Where `kahua://` asset URIs are resolved: the project folder, or the folder
+/// of a place file opened directly.
+fn asset_root(doc: &Document) -> PathBuf {
+    let path = doc.path();
+    if path.is_dir() { path.to_path_buf() } else { path.parent().map(|p| p.to_path_buf()).unwrap_or_default() }
 }

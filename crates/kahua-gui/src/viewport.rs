@@ -380,7 +380,19 @@ impl Viewport {
                 let axes = frame_axes(doc, self.local_axes);
                 let arrow = (self.camera.position.distance(center) * 0.12).max(1.0);
                 let extent = axes.map(|a| half.dot(a.abs()));
-                let length = if tool == Tool::Rotate { half.length().max(arrow) } else { arrow };
+                let length = if tool == Tool::Rotate {
+                    // Hug the selection: farthest part center plus that part's largest
+                    // half size. Unlike the world-aligned bounds, this does not grow
+                    // as the selection turns.
+                    let reach = ops::parts_to_transform(doc)
+                        .iter()
+                        .filter_map(|r| index.get(r).map(|&i| &scene.parts[i]))
+                        .map(|p| p.position().distance(center) + p.size.max_element() * 0.5)
+                        .fold(0.0f32, f32::max);
+                    (reach * 1.1).max(arrow * 0.5)
+                } else {
+                    arrow
+                };
                 Some(Gizmo { center, axes, extent, length, part: None })
             }
             Tool::Scale => {
@@ -699,7 +711,7 @@ fn frame_axes(doc: &Document, local: bool) -> [Vec3; 3] {
 /// Splits a scene into the parts `mine` accepts and the rest.
 fn split_scene(scene: &Scene, mut mine: impl FnMut(Ref) -> bool) -> (Scene, Scene) {
     let (a, b): (Vec<_>, Vec<_>) = scene.parts.iter().cloned().partition(|p| mine(p.owner));
-    (Scene { parts: a }, Scene { parts: b })
+    (Scene { parts: a, ..Default::default() }, Scene { parts: b, ..Default::default() })
 }
 
 fn translate(mut cf: CFrame, offset: Vec3) -> CFrame {
