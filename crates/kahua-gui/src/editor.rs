@@ -69,6 +69,10 @@ const ROTATE: KeyboardShortcut = shortcut(CMD, Key::R);
 const TILT: KeyboardShortcut = shortcut(CMD, Key::T);
 const SELECT_TOOL: KeyboardShortcut = shortcut(CMD, Key::Num1);
 const MOVE_TOOL: KeyboardShortcut = shortcut(CMD, Key::Num2);
+const SCALE_TOOL: KeyboardShortcut = shortcut(CMD, Key::Num3);
+const ROTATE_TOOL: KeyboardShortcut = shortcut(CMD, Key::Num4);
+const LOCAL_AXES: KeyboardShortcut = shortcut(CMD, Key::L);
+const SELECT_ALL: KeyboardShortcut = shortcut(CMD, Key::A);
 const CLOSE_TAB: KeyboardShortcut = shortcut(CMD, Key::W);
 
 impl Editor {
@@ -286,6 +290,18 @@ impl Editor {
         }
         if pressed(ui, &MOVE_TOOL) {
             self.tool = Tool::Move;
+        }
+        if pressed(ui, &SCALE_TOOL) {
+            self.tool = Tool::Scale;
+        }
+        if pressed(ui, &ROTATE_TOOL) {
+            self.tool = Tool::Rotate;
+        }
+        if pressed(ui, &LOCAL_AXES) {
+            self.viewport.local_axes = !self.viewport.local_axes;
+        }
+        if pressed(ui, &SELECT_ALL) {
+            ops::select_all(&mut self.doc);
         }
         let (delete, focus, rename) = ui.input_mut(|i| {
             (
@@ -505,6 +521,17 @@ impl Editor {
             };
             tool_button(ui, &mut self.tool, Tool::Select, Icon::Pointer, "Select", "Select (Ctrl+1)");
             tool_button(ui, &mut self.tool, Tool::Move, Icon::Move, "Move", "Move (Ctrl+2)");
+            tool_button(ui, &mut self.tool, Tool::Scale, Icon::Scale, "Scale", "Scale (Ctrl+3)");
+            tool_button(ui, &mut self.tool, Tool::Rotate, Icon::Rotate, "Rotate", "Rotate (Ctrl+4)");
+            let local = self.viewport.local_axes;
+            let (axes_icon, axes_label) = if local { (Icon::Cube, "Local") } else { (Icon::Globe, "World") };
+            if ui
+                .add(icons::toggle(local, axes_icon, axes_label).min_size(egui::vec2(0.0, 26.0)))
+                .on_hover_text("Move and rotate along world or local axes (Ctrl+L)")
+                .clicked()
+            {
+                self.viewport.local_axes = !local;
+            }
             ui.separator();
             ui.label(RichText::new("Part").color(theme::TEXT_WEAK));
             for (icon, label, kind, tip) in [
@@ -530,6 +557,15 @@ impl Editor {
             if changed {
                 config.save();
             }
+            ui.separator();
+            if ui
+                .add(egui::DragValue::new(&mut config.rotate_snap).speed(0.5).range(0.0..=180.0).suffix("°"))
+                .on_hover_text("Rotation snap in degrees (0 turns it off)")
+                .changed()
+            {
+                config.save();
+            }
+            self.viewport.rotate_snap = config.rotate_snap;
             ui.separator();
             if ui
                 .add_enabled(self.doc.can_undo(), icons::button(Icon::Undo, "Undo"))

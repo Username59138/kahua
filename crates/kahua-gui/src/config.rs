@@ -21,12 +21,20 @@ pub struct AppConfig {
     pub recent: Vec<RecentEntry>,
     pub snap: f32,
     pub snap_enabled: bool,
+    /// Rotation snap in degrees; 0 turns snapping off.
+    pub rotate_snap: f32,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        Self { projects_dir: home.join("KahuaProjects"), recent: Vec::new(), snap: 1.0, snap_enabled: true }
+        Self {
+            projects_dir: home.join("KahuaProjects"),
+            recent: Vec::new(),
+            snap: 1.0,
+            snap_enabled: true,
+            rotate_snap: 15.0,
+        }
     }
 }
 
