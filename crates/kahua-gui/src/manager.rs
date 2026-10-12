@@ -6,6 +6,7 @@ use eframe::egui::{self, Align, Color32, Layout, RichText, Sense, Ui};
 use kahua_core::kahua_io::{self, CreateOptions, project, template};
 
 use crate::config::{AppConfig, ago};
+use crate::icons::{self, Icon};
 use crate::log::Log;
 use crate::theme;
 
@@ -106,12 +107,17 @@ impl ProjectManager {
             .exact_size(220.0)
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::same(14)))
             .show(ui, |ui| {
-                let wide =
-                    |ui: &mut Ui, text: &str| ui.add_sized([ui.available_width(), 30.0], egui::Button::new(text));
+                let wide = |ui: &mut Ui, icon: Icon, text: &str| {
+                    ui.add_sized([ui.available_width(), 30.0], icons::button(icon, text))
+                };
                 if ui
                     .add_sized(
                         [ui.available_width(), 34.0],
-                        egui::Button::new(RichText::new("+  New Project").strong()).fill(theme::ACCENT),
+                        egui::Button::image_and_text(
+                            icons::image(Icon::Plus, 16.0, Color32::WHITE),
+                            RichText::new("New Project").strong(),
+                        )
+                        .fill(theme::ACCENT),
                     )
                     .clicked()
                 {
@@ -123,14 +129,14 @@ impl ProjectManager {
                     });
                 }
                 ui.add_space(4.0);
-                if wide(ui, "Import .rbxl…").clicked()
+                if wide(ui, Icon::Import, "Import .rbxl…").clicked()
                     && let Some(file) = rfd::FileDialog::new()
                         .add_filter("Roblox place or model", &["rbxl", "rbxlx", "rbxm", "rbxmx"])
                         .pick_file()
                 {
                     self.start_import(config, &file);
                 }
-                if wide(ui, "Open Folder…").clicked()
+                if wide(ui, Icon::FolderOpen, "Open Folder…").clicked()
                     && let Some(dir) = rfd::FileDialog::new().set_directory(&config.projects_dir).pick_folder()
                 {
                     if kahua_io::is_project_dir(&dir) {
@@ -142,7 +148,7 @@ impl ProjectManager {
                         ));
                     }
                 }
-                if wide(ui, "Open .rbxl File…").clicked()
+                if wide(ui, Icon::File, "Open .rbxl File…").clicked()
                     && let Some(file) = rfd::FileDialog::new()
                         .add_filter("Roblox place or model", &["rbxl", "rbxlx", "rbxm", "rbxmx"])
                         .pick_file()
@@ -200,7 +206,7 @@ impl ProjectManager {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter).hint_text("Filter projects").desired_width(240.0),
                     );
-                    if ui.button("⟳ Rescan").clicked() {
+                    if ui.add(icons::button(Icon::Refresh, "Rescan")).clicked() {
                         self.rescan(config);
                     }
                 });

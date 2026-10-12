@@ -12,6 +12,7 @@ publish = false
 anyhow = "1.0.104"
 dirs = "7.0.0"
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 kahua-core = { version = "0.1.0", path = "../kahua-core" }
 kahua-render = { version = "0.1.0", path = "../kahua-render" }
 rfd = "0.17.2"

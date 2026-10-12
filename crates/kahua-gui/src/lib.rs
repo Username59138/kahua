@@ -38,6 +38,7 @@ pub fn run(path: Option<PathBuf>) -> anyhow::Result<()> {
         "Kahua",
         options,
         Box::new(move |cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
             Ok(Box::new(KahuaApp::new(path)))
         }),

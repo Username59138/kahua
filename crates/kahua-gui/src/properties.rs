@@ -136,7 +136,7 @@ impl Properties {
 
         // Header: badge, name and class.
         ui.horizontal(|ui| {
-            icons::class_badge(ui, &class);
+            icons::class_icon(ui, &class);
             if selection.len() > 1 {
                 ui.label(RichText::new(format!("{} items", selection.len())).strong());
             } else {
@@ -150,7 +150,7 @@ impl Properties {
             }
             ui.label(RichText::new(&class).color(theme::TEXT_WEAK));
         });
-        if reflect::is_script(&class) && ui.button("Edit Script").clicked() {
+        if reflect::is_script(&class) && ui.add(icons::button(icons::Icon::Pen, "Edit Script")).clicked() {
             action = Some(PropertiesAction::OpenScript(first));
         }
         ui.separator();

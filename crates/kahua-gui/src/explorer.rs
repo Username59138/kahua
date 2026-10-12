@@ -8,7 +8,7 @@ use kahua_core::Document;
 use kahua_core::kahua_io::rbx_dom_weak::types::Ref;
 use kahua_core::kahua_io::reflect;
 
-use crate::icons;
+use crate::icons::{self, Icon};
 use crate::ops::INSERTABLE;
 use crate::theme;
 
@@ -135,17 +135,13 @@ impl Explorer {
                 let arrow_rect = Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(12.0, ROW_HEIGHT));
                 if row.has_children {
                     let open = self.expanded.contains(&row.r) || !self.filter.is_empty();
-                    ui.painter().text(
-                        arrow_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        if open { "⏷" } else { "⏵" },
-                        egui::FontId::proportional(10.0),
-                        theme::TEXT_WEAK,
-                    );
+                    let icon = if open { Icon::ChevronDown } else { Icon::ChevronRight };
+                    let chevron = Rect::from_center_size(arrow_rect.center(), egui::vec2(12.0, 12.0));
+                    icons::paint(ui, chevron, icon, theme::TEXT_WEAK);
                 }
-                let badge_rect =
-                    Rect::from_min_size(egui::pos2(x + 14.0, rect.center().y - 7.5), egui::vec2(15.0, 15.0));
-                icons::paint_badge(ui, badge_rect, &inst.class);
+                let icon_rect =
+                    Rect::from_min_size(egui::pos2(x + 14.0, rect.center().y - 8.0), egui::vec2(16.0, 16.0));
+                icons::paint_class(ui, icon_rect, &inst.class);
                 let text_pos = egui::pos2(x + 34.0, rect.center().y);
 
                 let is_renaming = self.renaming.as_ref().is_some_and(|(r, _, _)| *r == row.r);
@@ -268,7 +264,7 @@ impl Explorer {
             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                 for class in INSERTABLE {
                     ui.horizontal(|ui| {
-                        icons::class_badge(ui, class);
+                        icons::class_icon(ui, class);
                         if ui.button(*class).clicked() {
                             actions.push(ExplorerAction::Insert { parent: r, class: (*class).to_owned() });
                             self.expanded.insert(r);

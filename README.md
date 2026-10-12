@@ -131,5 +131,7 @@ Contributions are welcome — open an issue to talk about bigger changes first.
 Kahua is free software under the [GNU GPL v3 or later](LICENSE). The license covers Kahua's
 code only: places and projects you make with Kahua are yours.
 
+Icons are from [Lucide](https://lucide.dev) (ISC license, see `crates/kahua-gui/assets/icons/LICENSE`).
+
 Kahua is not affiliated with, endorsed by, or connected to Roblox Corporation. "Roblox" and
 "Roblox Studio" are trademarks of Roblox Corporation.

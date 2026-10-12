@@ -12,6 +12,7 @@ use kahua_render::scene::world_root;
 
 use crate::config::AppConfig;
 use crate::explorer::{Explorer, ExplorerAction};
+use crate::icons::{self, Icon};
 use crate::log::{Level, Log};
 use crate::ops::{self, PartKind};
 use crate::properties::{Properties, PropertiesAction};
@@ -492,32 +493,33 @@ impl Editor {
 
     fn toolbar(&mut self, ui: &mut Ui, config: &mut AppConfig, log: &mut Log) {
         ui.horizontal(|ui| {
-            let tool_button = |ui: &mut Ui, tool: &mut Tool, value: Tool, label: &str, tip: &str| {
+            let tool_button = |ui: &mut Ui, tool: &mut Tool, value: Tool, icon: Icon, label: &str, tip: &str| {
                 let selected = *tool == value;
                 if ui
-                    .add(egui::Button::selectable(selected, label).min_size(egui::vec2(64.0, 26.0)))
+                    .add(icons::toggle(selected, icon, label).min_size(egui::vec2(0.0, 26.0)))
                     .on_hover_text(tip)
                     .clicked()
                 {
                     *tool = value;
                 }
             };
-            tool_button(ui, &mut self.tool, Tool::Select, "⬉ Select", "Select (Ctrl+1)");
-            tool_button(ui, &mut self.tool, Tool::Move, "⬌ Move", "Move (Ctrl+2)");
+            tool_button(ui, &mut self.tool, Tool::Select, Icon::Pointer, "Select", "Select (Ctrl+1)");
+            tool_button(ui, &mut self.tool, Tool::Move, Icon::Move, "Move", "Move (Ctrl+2)");
             ui.separator();
             ui.label(RichText::new("Part").color(theme::TEXT_WEAK));
-            for (label, kind, tip) in [
-                ("Block", PartKind::Block, "Insert a block"),
-                ("Ball", PartKind::Sphere, "Insert a sphere"),
-                ("Cylinder", PartKind::Cylinder, "Insert a cylinder"),
-                ("Wedge", PartKind::Wedge, "Insert a wedge"),
-                ("Corner", PartKind::CornerWedge, "Insert a corner wedge"),
+            for (icon, label, kind, tip) in [
+                (Icon::Cube, "Block", PartKind::Block, "Insert a block"),
+                (Icon::Circle, "Ball", PartKind::Sphere, "Insert a sphere"),
+                (Icon::Cylinder, "Cylinder", PartKind::Cylinder, "Insert a cylinder"),
+                (Icon::Wedge, "Wedge", PartKind::Wedge, "Insert a wedge"),
+                (Icon::Pyramid, "Corner", PartKind::CornerWedge, "Insert a corner wedge"),
             ] {
-                if ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, 26.0))).on_hover_text(tip).clicked() {
+                if ui.add(icons::button(icon, label).min_size(egui::vec2(0.0, 26.0))).on_hover_text(tip).clicked() {
                     self.insert_part(kind, config);
                 }
             }
             ui.separator();
+            ui.add(icons::image(Icon::Magnet, 14.0, icons::TEXT));
             let mut changed = ui.checkbox(&mut config.snap_enabled, "Snap").changed();
             changed |= ui
                 .add_enabled(
@@ -529,17 +531,23 @@ impl Editor {
                 config.save();
             }
             ui.separator();
-            if ui.add_enabled(self.doc.can_undo(), egui::Button::new("⟲ Undo")).on_hover_text("Undo (Ctrl+Z)").clicked()
+            if ui
+                .add_enabled(self.doc.can_undo(), icons::button(Icon::Undo, "Undo"))
+                .on_hover_text("Undo (Ctrl+Z)")
+                .clicked()
             {
                 self.doc.undo();
             }
-            if ui.add_enabled(self.doc.can_redo(), egui::Button::new("⟳ Redo")).on_hover_text("Redo (Ctrl+Y)").clicked()
+            if ui
+                .add_enabled(self.doc.can_redo(), icons::button(Icon::Redo, "Redo"))
+                .on_hover_text("Redo (Ctrl+Y)")
+                .clicked()
             {
                 self.doc.redo();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let dirty = self.doc.is_dirty();
-                let save = egui::Button::new(if dirty { "Save*" } else { "Save" });
+                let save = icons::button(Icon::Save, if dirty { "Save*" } else { "Save" });
                 let save = if dirty { save.fill(theme::ACCENT) } else { save };
                 if ui.add(save).on_hover_text("Save (Ctrl+S)").clicked() {
                     self.save(log);
@@ -558,21 +566,22 @@ impl Editor {
     fn tab_bar(&mut self, ui: &mut Ui) {
         egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.add(egui::Button::selectable(self.active_tab.is_none(), "🗺 Scene")).clicked() {
+                if ui.add(icons::toggle(self.active_tab.is_none(), Icon::Cube, "Scene")).clicked() {
                     self.active_tab = None;
                 }
                 let mut close = None;
                 for &r in &self.tabs {
                     let Some(inst) = self.doc.dom.get_by_ref(r) else { continue };
-                    let label = inst.name.clone();
-                    let response = ui.add(egui::Button::selectable(self.active_tab == Some(r), label));
+                    let (icon, _) = icons::for_class(&inst.class);
+                    let response = ui.add(icons::toggle(self.active_tab == Some(r), icon, inst.name.clone()));
                     if response.clicked() {
                         self.active_tab = Some(r);
                     }
                     if response.middle_clicked() {
                         close = Some(r);
                     }
-                    if ui.small_button("×").on_hover_text("Close (Ctrl+W)").clicked() {
+                    let close_button = egui::Button::image(icons::image(Icon::Close, 12.0, icons::TEXT)).frame(false);
+                    if ui.add(close_button).on_hover_text("Close (Ctrl+W)").clicked() {
                         close = Some(r);
                     }
                 }
