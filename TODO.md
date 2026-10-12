@@ -10,24 +10,28 @@ What is left to do, roughly in planned order.
 - [ ] Dockable, rearrangeable panels with tabs
 
 ## Assets and build
-- [ ] `assets.lock`: file hash → Roblox asset ID, committed to git
-- [ ] `kahua build` replaces `kahua://` URIs with `rbxassetid://` from the lock file
+- [x] `assets.lock`: file hash → Roblox asset ID, committed to git
+- [x] `kahua build` replaces `kahua://` URIs with `rbxassetid://` from the lock file
 - [ ] Decals and Textures on part faces (render + insert)
+- [ ] Textures embedded in `.glb` are shown in Kahua but not uploaded: extract them into `assets/textures/` and set `TextureContent` on import
 - [ ] Read OBJ materials (`.mtl`, `map_Kd`) and texture alpha (cutouts)
-- [ ] Extract textures embedded in `.glb` into `assets/textures/` on import
 
 ## Account and publishing
-- [ ] First verify on a real account: how meshes are uploaded (Studio's internal endpoints vs Open Cloud "Model" assets) and how to get an image ID (not a decal ID) for textures
+- [x] Open Cloud client: image and mesh upload, operation polling, rate limits, place publishing
+- [x] Login cookie and API key in the system keyring (file fallback with 0600), `kahua login/logout/whoami`, File > Roblox Account
+- [x] Download meshes/textures/unions of existing places into `.kahua/cache`
+- [x] `kahua publish` and File > Publish to Roblox
+- [ ] **Verify on a real account** (nothing has touched live Roblox yet): the `"Mesh"` assetType string (in `kahua-net/src/open_cloud.rs`), that our version 2.00 `.mesh` files are accepted, image uploads, place publishing, assetdelivery downloads
 - [ ] Check whether Roblox computes MeshPart collision (`PhysicsData`) itself when it is missing
-- [ ] Login (session stored in the system keyring, never in the project), optional Open Cloud API key
-- [ ] Download meshes/textures of existing places into `.kahua/cache` so imported places render properly
-- [ ] Upload new assets and publish the place
+- [ ] Union `MeshData` handling is tested only with generated data; check with a real place
+- [ ] Windows Studio cookie discovery (only Vinegar's Wine registry is read)
+- [ ] OAuth "Sign in with Roblox" instead of pasting an API key (needs a registered OAuth app)
 
 ## Viewport and tools
 - [ ] Pass rotate snap through `ViewCtx` instead of copying it from the toolbar every frame
 - [ ] Surface drag: snap the object's corner, not the grabbed point
 - [ ] Scale: snap face positions, not the size
-- [ ] Unions (`UnionOperation`) still render as boxes
+- [ ] Unions render from their data, but clicking still uses the bounding box
 - [ ] Grid and orientation cube, camera speed setting
 
 ## Script editor

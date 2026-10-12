@@ -91,6 +91,35 @@ enum Command {
         position: Option<Vec3>,
     },
 
+    /// Save Roblox credentials: an Open Cloud API key (for publishing) and/or
+    /// a login cookie (for downloading assets of existing places).
+    Login {
+        /// Open Cloud API key; prompted for when the flag is given without a value.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        api_key: Option<String>,
+        /// The .ROBLOSECURITY cookie; prompted for when the flag is given without a value.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        cookie: Option<String>,
+        /// Reuse the login saved by Roblox Studio (running under Vinegar).
+        #[arg(long)]
+        from_studio: bool,
+    },
+
+    /// Forget saved Roblox credentials.
+    Logout,
+
+    /// Show which Roblox credentials are saved.
+    Whoami,
+
+    /// Upload changed assets and publish the place to Roblox.
+    Publish {
+        #[arg(default_value = ".")]
+        project: PathBuf,
+        /// Show what would be uploaded without uploading anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Render a screenshot without opening a window.
     Render {
         #[arg(default_value = ".")]
@@ -203,6 +232,25 @@ fn run(cli: Cli) -> Result<()> {
             println!("Added {name} ({}) to {}", imported.uri, project.dir().display());
             Ok(())
         }
+        Some(Command::Login { api_key, cookie, from_studio }) => login(api_key, cookie, from_studio),
+        Some(Command::Logout) => {
+            kahua_net::Credentials::clear()?;
+            println!("Logged out: saved API key and cookie removed");
+            Ok(())
+        }
+        Some(Command::Whoami) => {
+            let creds = kahua_net::Credentials::load()?;
+            println!("API key: {}", if creds.api_key.is_some() { "saved" } else { "not set" });
+            match &creds.cookie {
+                Some(cookie) => match kahua_net::kahua::check_cookie(cookie) {
+                    Ok(user) => println!("Roblox login: {} (@{}, id {})", user.display_name, user.name, user.id),
+                    Err(e) => println!("Roblox login: saved but not working ({e:#})"),
+                },
+                None => println!("Roblox login: not set"),
+            }
+            Ok(())
+        }
+        Some(Command::Publish { project, dry_run }) => publish(&project, dry_run),
         Some(Command::Render { input, output, width, height, camera, look_at, focus }) => {
             let doc = open(&input)?;
             // Meshes are looked up relative to the project, or the folder of a single file.
@@ -212,7 +260,21 @@ fn run(cli: Cli) -> Result<()> {
                 doc.path().parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
             };
             let mut assets = AssetStore::new(root);
-            let scene = Scene::extract_with_assets(&doc.dom, &mut assets);
+            if let Some(downloader) = kahua_net::kahua::saved_downloader() {
+                assets.set_downloader(downloader);
+            }
+            let mut scene = Scene::extract_with_assets(&doc.dom, &mut assets);
+            // Wait for meshes and textures that are being downloaded.
+            let started = std::time::Instant::now();
+            while assets.pending() > 0 && started.elapsed().as_secs() < 120 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if assets.poll() {
+                    scene = Scene::extract_with_assets(&doc.dom, &mut assets);
+                }
+            }
+            if assets.poll() {
+                scene = Scene::extract_with_assets(&doc.dom, &mut assets);
+            }
             print_warnings(&scene.warnings);
             let mut cam = kahua_render::default_camera(&scene);
             if let Some(path) = focus {
@@ -326,4 +388,88 @@ fn parse_vec3(s: &str) -> Result<Vec3, String> {
         [x, y, z] => Ok(Vec3::new(*x, *y, *z)),
         _ => Err("expected three numbers like 10,5,-3".into()),
     }
+}
+
+fn prompt_secret(what: &str) -> Result<String> {
+    use std::io::Write;
+    eprint!("{what}: ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let value = line.trim().to_owned();
+    if value.is_empty() {
+        bail!("no {what} given");
+    }
+    Ok(value)
+}
+
+fn login(api_key: Option<String>, cookie: Option<String>, from_studio: bool) -> Result<()> {
+    if api_key.is_none() && cookie.is_none() && !from_studio {
+        bail!("give --api-key, --cookie or --from-studio (see `kahua login --help`)");
+    }
+    let mut creds = kahua_net::Credentials::load().unwrap_or_default();
+    if let Some(key) = api_key {
+        let key = if key.is_empty() { prompt_secret("Open Cloud API key")? } else { key };
+        creds.api_key = Some(key);
+        println!("API key saved");
+    }
+    let cookie = match (cookie, from_studio) {
+        (Some(c), _) if !c.is_empty() => Some(c),
+        (Some(_), _) => Some(prompt_secret(".ROBLOSECURITY cookie (never share it with anyone)")?),
+        (None, true) => Some(
+            kahua_net::find_studio_cookie()
+                .context("no saved Roblox Studio login found (log in to Studio under Vinegar first)")?,
+        ),
+        (None, false) => None,
+    };
+    if let Some(cookie) = cookie {
+        let user = kahua_net::kahua::check_cookie(&cookie)?;
+        creds.cookie = Some(cookie);
+        println!("Logged in as {} (@{})", user.display_name, user.name);
+    }
+    creds.save()?;
+    Ok(())
+}
+
+fn publish(project: &Path, dry_run: bool) -> Result<()> {
+    use kahua_io::publish::{self, SyncEvent, SyncOptions};
+    if !kahua_io::is_project_dir(project) {
+        bail!("{} is not a project; publishing works on project folders", project.display());
+    }
+    let doc = open(project)?;
+    let mut progress = |event: SyncEvent| match event {
+        SyncEvent::Reused { .. } => {}
+        SyncEvent::Planned { path } => println!("would upload {path}"),
+        SyncEvent::Uploading { path, index, total } => println!("[{}/{total}] uploading {path}", index + 1),
+        SyncEvent::Uploaded { path, asset_id } => println!("  {path} -> rbxassetid://{asset_id}"),
+        SyncEvent::Failed { path, error } => eprintln!("  {path} failed: {error}"),
+        SyncEvent::Publishing { universe_id, place_id } => {
+            println!("publishing place {place_id} (universe {universe_id})")
+        }
+    };
+    if dry_run {
+        struct NoUpload;
+        impl publish::AssetUploader for NoUpload {
+            fn upload(&mut self, _: publish::AssetKind, _: &str, _: &str, _: &[u8]) -> Result<u64> {
+                bail!("dry run")
+            }
+            fn publish_place(&mut self, _: u64, _: u64, _: &[u8]) -> Result<u64> {
+                bail!("dry run")
+            }
+        }
+        let report =
+            publish::sync_assets_with(project, &doc.dom, &mut NoUpload, &SyncOptions { dry_run: true }, &mut progress)?;
+        println!("{} to upload, {} already uploaded", report.planned.len(), report.reused.len());
+        return Ok(());
+    }
+    let mut uploader = kahua_net::kahua::RobloxUploader::for_project(project)?;
+    let report = publish::publish(project, &doc.dom, &mut uploader, &mut progress)?;
+    print_warnings(&report.warnings);
+    println!(
+        "Published version {} ({} uploaded, {} reused)",
+        report.version,
+        report.sync.uploaded.len(),
+        report.sync.reused.len()
+    );
+    Ok(())
 }

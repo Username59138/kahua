@@ -29,6 +29,11 @@ It also runs headless: render screenshots of a place from the command line or in
   account needed: Insert → Mesh from File, or `kahua add-mesh`.
 - **Script editor** with Luau syntax highlighting, find and replace, go to line, auto-indent,
   block indent/unindent, comment toggling and bracket matching.
+- **Publishing to Roblox** through Open Cloud: changed meshes and textures are uploaded
+  (meshes are converted to Roblox's mesh format), their IDs are kept in `assets.lock`, then the
+  place is published. File → Publish to Roblox, or `kahua publish`.
+- **Meshes and unions of existing places** are downloaded and shown when you log in
+  (File → Roblox Account), and cached in `.kahua/cache`.
 - **Undo/redo** for everything.
 - **CLI and headless rendering** that need no display or GPU.
 
@@ -67,6 +72,10 @@ kahua info place.rbxl --depth 3         # print the instance tree
 kahua render my-game -o shot.png        # screenshot without a window
 kahua render place.rbxl --focus Workspace.Car --width 1920 --height 1080
 kahua add-mesh my-game sword.glb --position 0,5,0   # copy a mesh into the project
+kahua login --api-key                   # Open Cloud key, asked for interactively
+kahua login --from-studio               # reuse Roblox Studio's login (under Vinegar)
+kahua publish my-game                   # upload changed assets and publish
+kahua publish my-game --dry-run         # show what would be uploaded
 ```
 
 ### Editor shortcuts
@@ -111,7 +120,15 @@ my-game/
 - Scripts are plain `.luau` files. Instances that contain scripts become folders.
 - Everything else is a readable `.model.json`, so map changes show up as small git diffs.
 - Meshes and textures live in `assets/` and are referenced as `kahua://assets/meshes/sword.glb`.
-  Publishing (planned) will upload them and record the Roblox asset IDs.
+  Publishing uploads them and records the Roblox asset IDs in `assets.lock` (commit it, so
+  nobody uploads the same file twice). The project keeps the `kahua://` references.
+- Publishing settings are in `kahua.toml`:
+  ```toml
+  [publish]
+  universe_id = 1234567890
+  place_id = 1234567890
+  creator_user_id = 123     # or creator_group_id
+  ```
 - Instances that reference each other (welds, `PrimaryPart`) or hold binary data are stored as
   `.rbxm` so nothing is lost.
 - Existing Rojo projects keep their own layout: Kahua writes changes back where they came from
@@ -125,17 +142,26 @@ my-game/
 | `kahua-core` | The document, selection and undo/redo |
 | `kahua-render` | wgpu renderer used by both the window and `kahua render` |
 | `kahua-gui` | The editor window (egui) |
+| `kahua-net` | Roblox Open Cloud client, login session, credential storage |
 | `kahua` | The `kahua` command |
 
 ## Roadmap
 
-- Decals and textures on part faces; downloading meshes of existing places (needs an optional login)
+- Decals and textures on part faces
 - Properties grouped by category, Attributes and Tags, dockable panels
 - Luau autocompletion and type checking via luau-lsp
 - Optional login to publish places (internal Studio endpoints or Open Cloud)
 - Terrain, GUI editing, a minimal playtest mode
 
 Contributions are welcome — open an issue to talk about bigger changes first.
+
+## Accounts and security
+
+- The Open Cloud API key and the login cookie are stored in your system keyring (Secret Service),
+  or in `~/.config/kahua/credentials.toml` with `0600` permissions when no keyring is available.
+  They are never written into projects or logs.
+- The cookie is only used to download assets of existing places. Never share it: it gives full
+  access to your account.
 
 ## License
 

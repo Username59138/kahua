@@ -12,13 +12,17 @@ publish = false
 anyhow = "1.0.104"
 dirs = "7.0.0"
 flate2 = "1"
-keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"] }
+kahua-io = { version = "0.1.0", path = "../kahua-io" }
+kahua-render = { version = "0.1.0", path = "../kahua-render" }
+# async-secret-service talks D-Bus in pure Rust (zbus), so no libdbus is needed to build.
+keyring = { version = "3.6.3", features = ["async-secret-service", "async-io", "crypto-rust"] }
 log = "0.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+tempfile = "3.27.0"
 toml = "1.1.8"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
-tempfile = "3.27.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 tiny_http = "0.12"

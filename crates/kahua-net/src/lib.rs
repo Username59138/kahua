@@ -20,6 +20,8 @@ mod studio;
 #[cfg(test)]
 mod tests;
 
+pub mod kahua;
+
 pub use credentials::{CredentialStore, Credentials};
 pub use open_cloud::{AssetKind, Creator, OpenCloud, Timing};
 pub use session::{Session, User};

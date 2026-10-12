@@ -8,6 +8,7 @@ mod log;
 mod manager;
 mod ops;
 mod properties;
+mod roblox_ui;
 mod script_editor;
 mod theme;
 mod viewport;

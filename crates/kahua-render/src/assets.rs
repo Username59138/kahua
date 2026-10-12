@@ -298,6 +298,11 @@ impl AssetStore {
         }
     }
 
+    /// Downloads that are running or waiting to start.
+    pub fn pending(&self) -> usize {
+        self.running + self.queue.len()
+    }
+
     /// Collects the downloads that finished since the last call and starts queued
     /// ones. Returns true if any asset finished, loaded or failed, so the caller
     /// should extract the scene again.

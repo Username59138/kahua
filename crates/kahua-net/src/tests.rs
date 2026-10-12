@@ -455,3 +455,107 @@ fn clients_hide_secrets_in_debug_output() {
     assert!(!text.contains("secret-cookie-value"));
     assert!(text.contains("<redacted>"));
 }
+
+/// The whole publish flow through the real uploader: a project with a mesh and
+/// a texture is published to a mock Roblox, twice.
+#[test]
+fn publishing_a_project_uploads_assets_once_and_sends_the_place() {
+    use kahua_io::asset_lock::AssetLock;
+    use kahua_io::publish;
+    use kahua_io::rbx_dom_weak::types::{Content, Variant};
+
+    let ops = Arc::new(AtomicUsize::new(0));
+    let ops_in_handler = Arc::clone(&ops);
+    let mock = Mock::start(move |req, _| match (req.method.as_str(), req.path()) {
+        ("POST", "/assets/v1/assets") => {
+            let n = ops_in_handler.fetch_add(1, Ordering::SeqCst);
+            Reply::json(200, json!({ "path": format!("operations/op{n}"), "operationId": format!("op{n}") }))
+        }
+        ("GET", path) if path.starts_with("/assets/v1/operations/op") => {
+            let n: u64 = path.trim_start_matches("/assets/v1/operations/op").parse().unwrap();
+            Reply::json(200, json!({ "done": true, "response": { "assetId": (1000 + n).to_string() } }))
+        }
+        ("POST", path) if path.starts_with("/universes/v1/1/places/2/versions") => {
+            Reply::json(200, json!({ "versionNumber": 3 }))
+        }
+        other => Reply::json(404, json!({ "unexpected": format!("{other:?}") })),
+    });
+
+    // A project with one textured MeshPart.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("game");
+    let options = kahua_io::CreateOptions { git: false };
+    let (_, _) = kahua_io::project::create_from_dom(&dir, "game", &kahua_io::template::baseplate(), &options).unwrap();
+    let obj = tmp.path().join("cube.obj");
+    std::fs::write(
+        &obj,
+        "v -1 -1 -1\nv 1 -1 -1\nv 1 1 -1\nv -1 1 -1\nv -1 -1 1\nv 1 -1 1\nv 1 1 1\nv -1 1 1\n\
+         f 1 2 3\nf 1 3 4\nf 5 6 7\nf 5 7 8\nf 1 2 6\nf 1 6 5\nf 4 3 7\nf 4 7 8\n",
+    )
+    .unwrap();
+    let mesh = kahua_render::import_mesh(&dir, &obj).unwrap();
+    std::fs::create_dir_all(dir.join("assets/textures")).unwrap();
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 50, 50, 255]))
+        .save(dir.join("assets/textures/red.png"))
+        .unwrap();
+    let mut dom = kahua_io::template::baseplate();
+    let ws = kahua_io::template::workspace(&dom);
+    let size = kahua_io::rbx_types::Vector3::new(mesh.size.x, mesh.size.y, mesh.size.z);
+    dom.insert(
+        ws,
+        kahua_io::template::mesh_part("Cube", &mesh.uri, size, kahua_io::rbx_types::Vector3::new(0.0, 5.0, 0.0))
+            .with_property("TextureContent", Content::from_uri("kahua://assets/textures/red.png")),
+    );
+    std::fs::write(
+        dir.join("kahua.toml"),
+        "[project]\nname = \"game\"\n\n[publish]\nuniverse_id = 1\nplace_id = 2\ncreator_user_id = 7\n",
+    )
+    .unwrap();
+
+    let cloud = OpenCloud::new("test-key", Creator::User(7)).with_base_url(&mock.base).with_timing(fast_timing());
+    let mut uploader = crate::kahua::RobloxUploader::new(cloud);
+    let report = publish::publish(&dir, &dom, &mut uploader, &mut |_| {}).unwrap();
+    assert_eq!(report.version, 3);
+    assert_eq!(report.sync.uploaded.len(), 2);
+
+    let requests = mock.requests();
+    let uploads: Vec<&Recorded> = requests.iter().filter(|r| r.path() == "/assets/v1/assets").collect();
+    assert_eq!(uploads.len(), 2);
+    let mut kinds = Vec::new();
+    for upload in &uploads {
+        let parts = multipart_parts(upload.header("content-type").unwrap(), &upload.body);
+        let request: Value =
+            serde_json::from_slice(&parts.iter().find(|(h, _)| h.contains("\"request\"")).unwrap().1).unwrap();
+        let kind = request["assetType"].as_str().unwrap().to_owned();
+        let file = &parts.iter().find(|(h, _)| h.contains("\"fileContent\"")).unwrap().1;
+        if kind == "Image" {
+            assert!(file.starts_with(b"\x89PNG"), "image is sent as-is");
+        } else {
+            assert!(file.starts_with(b"version 2.00"), "mesh is converted to Roblox's format");
+        }
+        kinds.push(kind);
+    }
+    kinds.sort();
+    assert_eq!(kinds, ["Image", "Mesh"]);
+
+    // The published place refers to the uploaded asset IDs.
+    let place = requests.iter().find(|r| r.path().starts_with("/universes/")).unwrap();
+    let published = kahua_io::place::decode(&place.body).unwrap();
+    let uris: Vec<String> = published
+        .descendants()
+        .flat_map(|i| i.properties.values())
+        .filter_map(|v| match v {
+            Variant::Content(c) => c.as_uri().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert!(uris.iter().any(|u| u.starts_with("rbxassetid://100")), "{uris:?}");
+    assert!(!uris.iter().any(|u| u.starts_with("kahua://")), "{uris:?}");
+
+    // Publishing again uploads nothing new.
+    let lock = AssetLock::read(&dir).unwrap();
+    assert_eq!(lock.assets.len(), 2);
+    let again = publish::publish(&dir, &dom, &mut uploader, &mut |_| {}).unwrap();
+    assert_eq!(again.sync.uploaded.len(), 0);
+    assert_eq!(mock.requests().iter().filter(|r| r.path() == "/assets/v1/assets").count(), 2);
+}

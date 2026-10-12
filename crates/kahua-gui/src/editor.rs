@@ -16,6 +16,7 @@ use crate::icons::{self, Icon};
 use crate::log::{Level, Log};
 use crate::ops::{self, PartKind};
 use crate::properties::{Properties, PropertiesAction};
+use crate::roblox_ui::{AccountDialog, PublishDialog};
 use crate::script_editor;
 use crate::theme;
 use crate::viewport::{Tool, ViewCtx, Viewport};
@@ -50,6 +51,8 @@ pub struct Editor {
     show_output: bool,
     save_as: Option<SaveAsDialog>,
     about: bool,
+    account: Option<AccountDialog>,
+    publish: Option<PublishDialog>,
 }
 
 const fn shortcut(modifiers: Modifiers, key: Key) -> KeyboardShortcut {
@@ -80,7 +83,10 @@ const CLOSE_TAB: KeyboardShortcut = shortcut(CMD, Key::W);
 
 impl Editor {
     pub fn new(doc: Document) -> Self {
-        let assets = AssetStore::new(asset_root(&doc));
+        let mut assets = AssetStore::new(asset_root(&doc));
+        if let Some(downloader) = kahua_net::kahua::saved_downloader() {
+            assets.set_downloader(downloader);
+        }
         Self {
             doc,
             viewport: Viewport::default(),
@@ -98,6 +104,8 @@ impl Editor {
             show_output: true,
             save_as: None,
             about: false,
+            account: None,
+            publish: None,
         }
     }
 
@@ -162,6 +170,13 @@ impl Editor {
         log: &mut Log,
     ) -> Option<EditorAction> {
         let mut action = None;
+        // Meshes and textures downloaded from Roblox arrive in the background.
+        if self.assets.poll() {
+            self.scene_revision = None;
+        }
+        if self.assets.pending() > 0 {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
         let scene_changed = self.refresh_scene();
         for warning in &self.scene.warnings {
             if self.reported_warnings.insert(warning.clone()) {
@@ -423,6 +438,18 @@ impl Editor {
                 }
             }
             ui.separator();
+            if ui.add(icons::button(Icon::User, "Roblox Account…")).clicked() {
+                self.account = Some(AccountDialog::open());
+            }
+            let is_project = matches!(self.doc.source, Source::Project(_));
+            if ui
+                .add_enabled(is_project, icons::button(Icon::Upload, "Publish to Roblox…"))
+                .on_disabled_hover_text("Save as a project first")
+                .clicked()
+            {
+                self.publish = Some(PublishDialog::open(self.doc.path()));
+            }
+            ui.separator();
             if ui.button("Close Project").clicked() {
                 action = Some(EditorAction::Close);
             }
@@ -680,6 +707,26 @@ impl Editor {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, config: &mut AppConfig, log: &mut Log) {
+        if let Some(dialog) = &mut self.account {
+            let mut login_changed = false;
+            if !dialog.ui(ctx, log, &mut login_changed) {
+                self.account = None;
+            }
+            if login_changed {
+                // Start over so assets that failed without a login are fetched again.
+                let mut assets = AssetStore::new(asset_root(&self.doc));
+                if let Some(downloader) = kahua_net::kahua::saved_downloader() {
+                    assets.set_downloader(downloader);
+                }
+                self.assets = assets;
+                self.scene_revision = None;
+            }
+        }
+        if let Some(dialog) = &mut self.publish
+            && !dialog.ui(ctx, &self.doc.dom, log)
+        {
+            self.publish = None;
+        }
         if let Some(dialog) = &mut self.save_as {
             let mut close = false;
             egui::Modal::new(egui::Id::new("save_as_project")).show(ctx, |ui| {

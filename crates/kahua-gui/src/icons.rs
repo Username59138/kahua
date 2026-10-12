@@ -69,6 +69,7 @@ icons! {
     Pen => "square-pen",
     ChevronRight => "chevron-right",
     ChevronDown => "chevron-down",
+    Upload => "upload",
     ChevronUp => "chevron-up",
     CaseSensitive => "case-sensitive",
     WholeWord => "whole-word",

@@ -9,6 +9,10 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/Username59138/kahua"
 rust-version = "1.95"
 
+[profile.dev]
+# Full debug info made target/ grow to tens of GB; line tables keep backtraces useful.
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 # Dependencies (wgpu, egui, image) are much faster with optimizations.
 opt-level = 2

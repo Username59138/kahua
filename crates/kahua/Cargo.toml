@@ -13,6 +13,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 kahua-core = { version = "0.1.0", path = "../kahua-core" }
 kahua-gui = { version = "0.1.0", path = "../kahua-gui", optional = true }
 kahua-io = { version = "0.1.0", path = "../kahua-io" }
+kahua-net = { version = "0.1.0", path = "../kahua-net" }
 kahua-render = { version = "0.1.0", path = "../kahua-render" }
 
 [features]
