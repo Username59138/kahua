@@ -67,6 +67,11 @@ icons! {
     Pen => "square-pen",
     ChevronRight => "chevron-right",
     ChevronDown => "chevron-down",
+    ChevronUp => "chevron-up",
+    CaseSensitive => "case-sensitive",
+    WholeWord => "whole-word",
+    Replace => "replace",
+    ReplaceAll => "replace-all",
 }
 
 /// Default color for icons in buttons and text.
