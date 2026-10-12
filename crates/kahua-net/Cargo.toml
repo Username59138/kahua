@@ -1,0 +1,24 @@
+[package]
+name = "kahua-net"
+description = "Kahua network client: Roblox Open Cloud, cookie session and credential storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "7.0.0"
+flate2 = "1"
+keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"] }
+log = "0.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tiny_http = "0.12"
