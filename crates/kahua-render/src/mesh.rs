@@ -10,6 +10,8 @@ use crate::scene::Shape;
 pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    /// Texture coordinates (0 for the basic shapes, which have no texture).
+    pub uv: [f32; 2],
 }
 
 #[derive(Default)]
@@ -20,7 +22,7 @@ pub struct MeshData {
 
 impl MeshData {
     fn push(&mut self, p: Vec3, n: Vec3) -> u32 {
-        self.vertices.push(Vertex { position: p.to_array(), normal: n.to_array() });
+        self.vertices.push(Vertex { position: p.to_array(), normal: n.to_array(), uv: [0.0, 0.0] });
         (self.vertices.len() - 1) as u32
     }
 

@@ -1,15 +1,18 @@
 //! The wgpu renderer. It draws into its own offscreen texture, which the GUI
 //! shows as an image and the CLI reads back as a screenshot.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat3, Vec3, Vec4};
+use glam::{Mat3, Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
+use crate::assets::{LoadedImage, LoadedMesh};
 use crate::camera::Camera;
 use crate::mesh::{self, Vertex};
-use crate::scene::{Scene, Shape};
+use crate::scene::{Scene, ScenePart, Shape};
 
 /// Color format of the rendered image (sRGB, ready to display or save).
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -71,7 +74,16 @@ impl Overlay {
     }
 }
 
-struct Mesh {
+/// What a draw group renders: a basic shape, or one primitive of a loaded mesh
+/// with a texture. Meshes and textures are identified by their `Arc` address,
+/// which stays unique while the renderer holds the `Arc`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum GroupKey {
+    Shape(Shape),
+    Asset { mesh: usize, primitive: usize, texture: usize },
+}
+
+struct GpuMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
@@ -107,6 +119,15 @@ impl Batch {
     }
 }
 
+/// Everything drawn with one mesh and one texture. Opaque and transparent
+/// instances are kept apart; the transparent ones are sorted every frame.
+struct Group {
+    mesh: Arc<GpuMesh>,
+    texture: Arc<wgpu::BindGroup>,
+    opaque: Batch,
+    transparent: Batch,
+}
+
 struct Target {
     size: (u32, u32),
     msaa: Option<wgpu::TextureView>,
@@ -122,18 +143,54 @@ pub struct Renderer {
     sample_count: u32,
     globals: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    texture_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// A 1x1 white texture, used when a draw has no texture.
+    white: Option<Arc<wgpu::BindGroup>>,
     opaque_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
-    meshes: HashMap<Shape, Mesh>,
-    opaque: HashMap<Shape, Batch>,
-    transparent: HashMap<Shape, Batch>,
-    /// Transparent parts kept on the CPU so they can be sorted per frame.
-    transparent_parts: Vec<(Shape, Vec3, InstanceRaw)>,
+    shape_meshes: HashMap<Shape, Arc<GpuMesh>>,
+    /// Uploaded primitives of loaded meshes, by (mesh address, primitive index).
+    asset_meshes: HashMap<(usize, usize), Arc<GpuMesh>>,
+    /// The loaded meshes behind `asset_meshes`. Holding them keeps their addresses valid.
+    mesh_sources: HashMap<usize, Arc<LoadedMesh>>,
+    /// Uploaded textures by address, with the image that keeps the address valid.
+    textures: HashMap<usize, (Arc<wgpu::BindGroup>, Arc<LoadedImage>)>,
+    groups: HashMap<GroupKey, Group>,
+    /// Transparent instances kept on the CPU so they can be sorted per frame.
+    transparent_items: Vec<(GroupKey, Vec3, InstanceRaw)>,
     lines: Option<wgpu::Buffer>,
     lines_capacity: usize,
     target: Option<Target>,
+}
+
+fn create_gpu_mesh(device: &wgpu::Device, vertices: &[Vertex], indices: &[u32]) -> GpuMesh {
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("kahua mesh vertices"),
+        contents: bytemuck::cast_slice(vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("kahua mesh indices"),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    GpuMesh { vertices: vertex_buffer, indices: index_buffer, index_count: indices.len() as u32 }
+}
+
+fn instance_raw(model: Mat4, color: [f32; 4]) -> InstanceRaw {
+    let normal = Mat3::from_mat4(model).inverse().transpose();
+    InstanceRaw {
+        model: model.to_cols_array_2d(),
+        normal: [
+            normal.x_axis.extend(0.0).to_array(),
+            normal.y_axis.extend(0.0).to_array(),
+            normal.z_axis.extend(0.0).to_array(),
+        ],
+        color,
+    }
 }
 
 impl Renderer {
@@ -167,8 +224,44 @@ impl Renderer {
             layout: &bind_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() }],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("kahua layout"),
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("kahua texture layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("kahua sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        // Parts use both groups; the sky and overlays only need the globals.
+        let part_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("kahua part layout"),
+            bind_group_layouts: &[Some(&bind_layout), Some(&texture_layout)],
+            immediate_size: 0,
+        });
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("kahua overlay layout"),
             bind_group_layouts: &[Some(&bind_layout)],
             immediate_size: 0,
         });
@@ -176,14 +269,14 @@ impl Renderer {
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
         };
         let instance_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<InstanceRaw>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![
-                2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4,
-                6 => Float32x4, 7 => Float32x4, 8 => Float32x4, 9 => Float32x4
+                3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4,
+                7 => Float32x4, 8 => Float32x4, 9 => Float32x4, 10 => Float32x4
             ],
         };
         let multisample = wgpu::MultisampleState { count: sample_count, ..Default::default() };
@@ -191,7 +284,7 @@ impl Renderer {
         let part_pipeline = |label: &str, blend: Option<wgpu::BlendState>, depth_write: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&layout),
+                layout: Some(&part_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_part"),
@@ -235,7 +328,7 @@ impl Renderer {
         });
         let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("kahua lines"),
-            layout: Some(&layout),
+            layout: Some(&overlay_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_line"),
@@ -264,7 +357,7 @@ impl Renderer {
         });
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("kahua sky"),
-            layout: Some(&layout),
+            layout: Some(&overlay_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_sky"),
@@ -284,21 +377,11 @@ impl Renderer {
             cache: None,
         });
 
-        let meshes = Shape::ALL
+        let shape_meshes = Shape::ALL
             .iter()
             .map(|&shape| {
                 let data = mesh::build(shape);
-                let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("kahua mesh vertices"),
-                    contents: bytemuck::cast_slice(&data.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("kahua mesh indices"),
-                    contents: bytemuck::cast_slice(&data.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-                (shape, Mesh { vertices, indices, index_count: data.indices.len() as u32 })
+                (shape, Arc::new(create_gpu_mesh(device, &data.vertices, &data.indices)))
             })
             .collect();
 
@@ -306,46 +389,172 @@ impl Renderer {
             sample_count,
             globals,
             bind_group,
+            texture_layout,
+            sampler,
+            white: None,
             opaque_pipeline,
             transparent_pipeline,
             line_pipeline,
             sky_pipeline,
-            meshes,
-            opaque: Shape::ALL.iter().map(|&s| (s, Batch::new())).collect(),
-            transparent: Shape::ALL.iter().map(|&s| (s, Batch::new())).collect(),
-            transparent_parts: Vec::new(),
+            shape_meshes,
+            asset_meshes: HashMap::new(),
+            mesh_sources: HashMap::new(),
+            textures: HashMap::new(),
+            groups: HashMap::new(),
+            transparent_items: Vec::new(),
             lines: None,
             lines_capacity: 0,
             target: None,
         }
     }
 
-    /// Uploads the parts to draw. Call when the scene changes, not every frame.
-    pub fn set_scene(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) {
-        let mut opaque: HashMap<Shape, Vec<InstanceRaw>> = HashMap::new();
-        self.transparent_parts.clear();
-        for part in &scene.parts {
-            let model = part.model_matrix();
-            let normal = Mat3::from_mat4(model).inverse().transpose();
-            let raw = InstanceRaw {
-                model: model.to_cols_array_2d(),
-                normal: [
-                    normal.x_axis.extend(0.0).to_array(),
-                    normal.y_axis.extend(0.0).to_array(),
-                    normal.z_axis.extend(0.0).to_array(),
-                ],
-                color: part.color,
-            };
-            if part.color[3] < 0.999 {
-                self.transparent_parts.push((part.shape, part.position(), raw));
-            } else {
-                opaque.entry(part.shape).or_default().push(raw);
+    /// Uploads a texture with its mip levels (`(width, height, RGBA8 pixels)`,
+    /// largest first) and returns the bind group that samples it.
+    fn upload_texture(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        levels: &[(u32, u32, &[u8])],
+    ) -> wgpu::BindGroup {
+        let (width, height, _) = levels[0];
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("kahua texture"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, &(w, h, pixels)) in levels.iter().enumerate() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                pixels,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
+        let view = texture.create_view(&Default::default());
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kahua texture"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        })
+    }
+
+    /// Uploads a loaded mesh primitive and its texture, unless already uploaded.
+    fn ensure_asset(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &Arc<LoadedMesh>,
+        primitive: usize,
+        texture: Option<&Arc<LoadedImage>>,
+    ) {
+        let mesh_key = Arc::as_ptr(mesh) as usize;
+        if let Entry::Vacant(entry) = self.asset_meshes.entry((mesh_key, primitive)) {
+            let p = &mesh.primitives[primitive];
+            entry.insert(Arc::new(create_gpu_mesh(device, &p.vertices, &p.indices)));
+            self.mesh_sources.entry(mesh_key).or_insert_with(|| mesh.clone());
+        }
+        if let Some(image) = texture {
+            let key = Arc::as_ptr(image) as usize;
+            if !self.textures.contains_key(&key) {
+                let levels: Vec<(u32, u32, &[u8])> =
+                    image.levels.iter().map(|l| (l.width, l.height, l.rgba.as_slice())).collect();
+                let bind_group = self.upload_texture(device, queue, &levels);
+                self.textures.insert(key, (Arc::new(bind_group), image.clone()));
             }
         }
-        for shape in Shape::ALL {
-            let data = opaque.remove(&shape).unwrap_or_default();
-            self.opaque.get_mut(&shape).unwrap().upload(device, queue, &data);
+    }
+
+    fn new_group(&self, key: GroupKey) -> Group {
+        let white = self.white.clone().expect("white texture is created by set_scene");
+        let (mesh, texture) = match key {
+            GroupKey::Shape(shape) => (self.shape_meshes[&shape].clone(), white),
+            GroupKey::Asset { mesh, primitive, texture } => {
+                let texture = if texture == 0 { white } else { self.textures[&texture].0.clone() };
+                (self.asset_meshes[&(mesh, primitive)].clone(), texture)
+            }
+        };
+        Group { mesh, texture, opaque: Batch::new(), transparent: Batch::new() }
+    }
+
+    /// Uploads the parts to draw. Call when the scene changes, not every frame.
+    pub fn set_scene(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) {
+        if self.white.is_none() {
+            let white = [255u8; 4];
+            self.white = Some(Arc::new(self.upload_texture(device, queue, &[(1, 1, &white[..])])));
         }
+
+        let mut opaque: HashMap<GroupKey, Vec<InstanceRaw>> = HashMap::new();
+        let mut transparent: Vec<(GroupKey, Vec3, InstanceRaw)> = Vec::new();
+        let mut used_assets = HashSet::new();
+        let mut used_meshes = HashSet::new();
+        let mut used_textures = HashSet::new();
+
+        for part in &scene.parts {
+            let model = part.model_matrix();
+            let mut add = |key: GroupKey, color: [f32; 4], part: &ScenePart| {
+                let raw = instance_raw(model, color);
+                if color[3] < 0.999 {
+                    transparent.push((key, part.position(), raw));
+                } else {
+                    opaque.entry(key).or_default().push(raw);
+                }
+            };
+            match &part.mesh {
+                None => add(GroupKey::Shape(part.shape), part.color, part),
+                Some(mesh_ref) => {
+                    for (index, primitive) in mesh_ref.mesh.primitives.iter().enumerate() {
+                        if primitive.vertices.is_empty() || primitive.indices.is_empty() {
+                            continue;
+                        }
+                        let texture = mesh_ref.texture.as_ref().or(primitive.texture.as_ref());
+                        self.ensure_asset(device, queue, &mesh_ref.mesh, index, texture);
+                        let mesh_key = Arc::as_ptr(&mesh_ref.mesh) as usize;
+                        used_assets.insert((mesh_key, index));
+                        used_meshes.insert(mesh_key);
+                        let texture_key = texture.map_or(0, |t| {
+                            used_textures.insert(Arc::as_ptr(t) as usize);
+                            Arc::as_ptr(t) as usize
+                        });
+                        // A texture is shown as it is; Color only tints untextured surfaces.
+                        let color = if texture.is_some() { [1.0, 1.0, 1.0, part.color[3]] } else { part.color };
+                        let key = GroupKey::Asset { mesh: mesh_key, primitive: index, texture: texture_key };
+                        add(key, color, part);
+                    }
+                }
+            }
+        }
+
+        self.asset_meshes.retain(|k, _| used_assets.contains(k));
+        self.mesh_sources.retain(|k, _| used_meshes.contains(k));
+        self.textures.retain(|k, _| used_textures.contains(k));
+
+        let keys: HashSet<GroupKey> = opaque.keys().copied().chain(transparent.iter().map(|(k, _, _)| *k)).collect();
+        let mut groups = HashMap::with_capacity(keys.len());
+        for key in keys {
+            // Reuse the batch buffers of groups that were drawn before.
+            let mut group = match self.groups.remove(&key) {
+                Some(group) => group,
+                None => self.new_group(key),
+            };
+            let data: &[InstanceRaw] = opaque.get(&key).map_or(&[], |v| v.as_slice());
+            group.opaque.upload(device, queue, data);
+            groups.insert(key, group);
+        }
+        self.groups = groups;
+        self.transparent_items = transparent;
     }
 
     fn ensure_target(&mut self, device: &wgpu::Device, size: (u32, u32)) {
@@ -412,13 +621,13 @@ impl Renderer {
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
-        // Sort transparent parts back to front.
+        // Sort transparent instances back to front, then upload them per group.
         let cam = camera.position;
-        self.transparent_parts.sort_by(|a, b| b.1.distance_squared(cam).total_cmp(&a.1.distance_squared(cam)));
-        for shape in Shape::ALL {
+        self.transparent_items.sort_by(|a, b| b.1.distance_squared(cam).total_cmp(&a.1.distance_squared(cam)));
+        for (key, group) in self.groups.iter_mut() {
             let data: Vec<InstanceRaw> =
-                self.transparent_parts.iter().filter(|(s, _, _)| *s == shape).map(|(_, _, raw)| *raw).collect();
-            self.transparent.get_mut(&shape).unwrap().upload(device, queue, &data);
+                self.transparent_items.iter().filter(|(k, _, _)| k == key).map(|(_, _, raw)| *raw).collect();
+            group.transparent.upload(device, queue, &data);
         }
 
         let line_count = overlay.lines.len();
@@ -467,18 +676,16 @@ impl Renderer {
             pass.set_pipeline(&self.sky_pipeline);
             pass.draw(0..3, 0..1);
 
-            for (pipeline, batches) in
-                [(&self.opaque_pipeline, &self.opaque), (&self.transparent_pipeline, &self.transparent)]
-            {
+            for (pipeline, transparent) in [(&self.opaque_pipeline, false), (&self.transparent_pipeline, true)] {
                 pass.set_pipeline(pipeline);
-                for shape in Shape::ALL {
-                    let batch = &batches[&shape];
+                for group in self.groups.values() {
+                    let batch = if transparent { &group.transparent } else { &group.opaque };
                     let (Some(buffer), true) = (&batch.buffer, batch.count > 0) else { continue };
-                    let mesh = &self.meshes[&shape];
-                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_bind_group(1, &*group.texture, &[]);
+                    pass.set_vertex_buffer(0, group.mesh.vertices.slice(..));
                     pass.set_vertex_buffer(1, buffer.slice(..));
-                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..batch.count);
+                    pass.set_index_buffer(group.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..group.mesh.index_count, 0, 0..batch.count);
                 }
             }
 

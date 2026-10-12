@@ -7,18 +7,22 @@ struct Globals {
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
+// Base color texture of the draw. Basic shapes use a white 1x1 texture.
+@group(1) @binding(0) var base_tex: texture_2d<f32>;
+@group(1) @binding(1) var base_sampler: sampler;
 
 struct PartIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) m0: vec4<f32>,
-    @location(3) m1: vec4<f32>,
-    @location(4) m2: vec4<f32>,
-    @location(5) m3: vec4<f32>,
-    @location(6) n0: vec4<f32>,
-    @location(7) n1: vec4<f32>,
-    @location(8) n2: vec4<f32>,
-    @location(9) color: vec4<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) m0: vec4<f32>,
+    @location(4) m1: vec4<f32>,
+    @location(5) m2: vec4<f32>,
+    @location(6) m3: vec4<f32>,
+    @location(7) n0: vec4<f32>,
+    @location(8) n1: vec4<f32>,
+    @location(9) n2: vec4<f32>,
+    @location(10) color: vec4<f32>,
 };
 
 struct PartOut {
@@ -26,6 +30,7 @@ struct PartOut {
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) uv: vec2<f32>,
 };
 
 @vertex
@@ -38,11 +43,15 @@ fn vs_part(v: PartIn) -> PartOut {
     out.world = world.xyz;
     out.normal = normalize(normal_matrix * v.normal);
     out.color = v.color;
+    out.uv = v.uv;
     return out;
 }
 
 @fragment
 fn fs_part(v: PartOut) -> @location(0) vec4<f32> {
+    // The texture is multiplied by the instance color: the part's Color when
+    // it has no texture, white when it has one (so the texture shows as-is).
+    let base = textureSample(base_tex, base_sampler, v.uv) * v.color;
     let n = normalize(v.normal);
     let sun = normalize(g.sun_dir.xyz);
     let hemi = mix(g.ground.rgb, g.sky.rgb, n.y * 0.5 + 0.5);
@@ -50,12 +59,12 @@ fn fs_part(v: PartOut) -> @location(0) vec4<f32> {
     let view_dir = normalize(g.camera_pos.xyz - v.world);
     let half_dir = normalize(view_dir + sun);
     let spec = pow(max(dot(n, half_dir), 0.0), 48.0) * 0.12;
-    var lit = v.color.rgb * (hemi * 0.55 + vec3<f32>(1.0, 0.97, 0.92) * diffuse * 0.65) + spec;
+    var lit = base.rgb * (hemi * 0.55 + vec3<f32>(1.0, 0.97, 0.92) * diffuse * 0.65) + spec;
     // Distance fog toward the sky color.
     let dist = length(g.camera_pos.xyz - v.world);
     let fog = clamp((dist - 600.0) / 3000.0, 0.0, 0.85);
     lit = mix(lit, g.sky.rgb, fog);
-    return vec4<f32>(lit, v.color.a);
+    return vec4<f32>(lit, base.a);
 }
 
 struct LineIn {

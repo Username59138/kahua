@@ -9,10 +9,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use kahua_core::Document;
 use kahua_io::rbx_dom_weak::WeakDom;
-use kahua_io::rbx_dom_weak::types::Ref;
-use kahua_io::{CreateOptions, project};
+use kahua_io::rbx_dom_weak::types::{Ref, Vector3};
+use kahua_io::{CreateOptions, Loaded, Project, project, template};
 use kahua_render::glam::Vec3;
-use kahua_render::{Camera, Headless, Scene, scene};
+use kahua_render::{AssetStore, Camera, Headless, Scene, scene};
 
 #[derive(Parser)]
 #[command(name = "kahua", version, about = "Open source editor for Roblox places")]
@@ -69,6 +69,20 @@ enum Command {
         /// How many levels of the tree to print.
         #[arg(short, long, default_value_t = 2)]
         depth: usize,
+    },
+
+    /// Copy a mesh (.glb, .gltf or .obj) into a project and place it in Workspace.
+    AddMesh {
+        /// Project directory.
+        project: PathBuf,
+        /// Mesh file to copy into the project's assets/meshes folder.
+        file: PathBuf,
+        /// Name of the MeshPart (defaults to the file name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Center of the part, e.g. `--position 0,2,0` (default: on top of the baseplate, at its height / 2).
+        #[arg(long, value_parser = parse_vec3)]
+        position: Option<Vec3>,
     },
 
     /// Render a screenshot without opening a window.
@@ -149,9 +163,42 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::AddMesh { project: dir, file, name, position }) => {
+            if !dir.is_dir() || !kahua_io::is_project_dir(&dir) {
+                bail!("{} is not a project (no default.project.json)", dir.display());
+            }
+            let Loaded { mut dom, mut project, warnings } = Project::open(&dir)?;
+            print_warnings(&warnings);
+            let imported = kahua_render::import_mesh(project.dir(), &file)?;
+            let name = name.unwrap_or_else(|| {
+                file.file_stem().map_or_else(|| "Mesh".to_owned(), |s| s.to_string_lossy().into_owned())
+            });
+            let position = position.unwrap_or(Vec3::new(0.0, imported.size.y / 2.0, 0.0));
+            let size = imported.size;
+            let part = template::mesh_part(
+                &name,
+                &imported.uri,
+                Vector3::new(size.x, size.y, size.z),
+                Vector3::new(position.x, position.y, position.z),
+            );
+            let workspace = template::workspace(&dom);
+            dom.insert(workspace, part);
+            let warnings = project.save(&dom)?;
+            print_warnings(&warnings);
+            println!("Added {name} ({}) to {}", imported.uri, project.dir().display());
+            Ok(())
+        }
         Some(Command::Render { input, output, width, height, camera, look_at, focus }) => {
             let doc = open(&input)?;
-            let scene = Scene::extract(&doc.dom);
+            // Meshes are looked up relative to the project, or the folder of a single file.
+            let root = if doc.path().is_dir() {
+                doc.path().to_path_buf()
+            } else {
+                doc.path().parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+            };
+            let mut assets = AssetStore::new(root);
+            let scene = Scene::extract_with_assets(&doc.dom, &mut assets);
+            print_warnings(&scene.warnings);
             let mut cam = kahua_render::default_camera(&scene);
             if let Some(path) = focus {
                 let target = find_path(&doc.dom, &path).with_context(|| format!("{path} not found"))?;

@@ -131,3 +131,48 @@ fn read_texture(
     buffer.unmap();
     RgbaImage::from_raw(width, height, pixels).context("bad image size")
 }
+
+#[cfg(test)]
+mod tests {
+    use kahua_io::rbx_dom_weak::types::{Color3, Vector3};
+
+    use super::*;
+    use crate::assets::{AssetStore, fixtures};
+    use crate::scene::Scene;
+
+    #[test]
+    fn textured_mesh_shows_its_texture_as_is() {
+        let project = tempfile::tempdir().unwrap();
+        // A green texture on a 4x4 quad facing the camera. The part's Color is
+        // red, which must not tint a textured surface.
+        fixtures::quad_gltf(project.path(), "quad.gltf", [0, 255, 0, 255]);
+        let mut dom = kahua_io::template::empty();
+        let workspace = kahua_io::template::workspace(&dom);
+        let quad = kahua_io::template::mesh_part(
+            "Quad",
+            "kahua://quad.gltf",
+            Vector3::new(2.0, 2.0, 0.0),
+            Vector3::new(0.0, 0.0, 0.0),
+        )
+        .with_property("Size", Vector3::new(4.0, 4.0, 1.0))
+        .with_property("Color", Color3::new(1.0, 0.0, 0.0));
+        dom.insert(workspace, quad);
+
+        let mut headless = match Headless::new() {
+            Ok(headless) => headless,
+            Err(e) => {
+                eprintln!("skipping textured render test: {e:#}");
+                return;
+            }
+        };
+        let mut assets = AssetStore::new(project.path());
+        let scene = Scene::extract_with_assets(&dom, &mut assets);
+        assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+        let mut camera = Camera::default();
+        camera.look_at(glam::Vec3::new(0.0, 0.0, 6.0), glam::Vec3::ZERO);
+        let image = headless.render(&scene, &camera, &Overlay::default(), 128, 128).unwrap();
+
+        let [r, g, b, _] = image.get_pixel(64, 64).0;
+        assert!(g > 90 && g > 2 * r && g > 2 * b, "center should be the green texture, got {:?}", [r, g, b]);
+    }
+}

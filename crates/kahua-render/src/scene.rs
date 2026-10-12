@@ -1,9 +1,14 @@
 //! Turning a DOM into a list of drawable parts, plus picking and bounds.
 
+use std::sync::Arc;
+
 use glam::{Mat3, Mat4, Quat, Vec3};
+use kahua_io::assets as asset_uri;
 use kahua_io::rbx_dom_weak::types::{CFrame, Matrix3, Ref, Variant, Vector3};
 use kahua_io::rbx_dom_weak::{Instance, Ustr, WeakDom};
 use kahua_io::reflect;
+
+use crate::assets::{AssetStore, LoadedImage, LoadedMesh, mesh_scale};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Shape {
@@ -28,10 +33,24 @@ pub struct ScenePart {
     pub transform: Mat4,
     /// The part's Size property.
     pub size: Vec3,
-    /// The scale applied to the unit mesh (differs from size for balls and cylinders).
+    /// The scale applied to the unit mesh (differs from size for balls and
+    /// cylinders). For a MeshPart with a loaded mesh it is `Size / InitialSize`,
+    /// applied to the mesh's own geometry.
     pub mesh_scale: Vec3,
     /// Linear RGB + alpha (1 - Transparency).
     pub color: [f32; 4],
+    /// The loaded mesh drawn in place of the basic shape. `shape` and `size`
+    /// still describe the part's box, which picking uses.
+    pub mesh: Option<MeshRef>,
+}
+
+/// A loaded mesh for a MeshPart, with the texture the part overrides it with.
+#[derive(Debug, Clone)]
+pub struct MeshRef {
+    pub mesh: Arc<LoadedMesh>,
+    /// The part's own texture (TextureContent/TextureID). When absent, each
+    /// primitive uses the texture from its file.
+    pub texture: Option<Arc<LoadedImage>>,
 }
 
 impl ScenePart {
@@ -62,6 +81,8 @@ impl ScenePart {
 #[derive(Debug, Default, Clone)]
 pub struct Scene {
     pub parts: Vec<ScenePart>,
+    /// Problems loading assets. Parts with a broken mesh are drawn as boxes.
+    pub warnings: Vec<String>,
 }
 
 pub fn cframe_to_mat4(cf: &CFrame) -> Mat4 {
@@ -160,42 +181,108 @@ pub fn is_renderable(inst: &Instance) -> bool {
     reflect::is_base_part(&inst.class) && inst.class != "Terrain"
 }
 
-impl Scene {
-    pub fn extract(dom: &WeakDom) -> Self {
-        let mut parts = Vec::new();
-        for inst in dom.descendants_of(world_root(dom)) {
-            if !is_renderable(inst) {
-                continue;
-            }
-            let Some(cf) = part_cframe(inst) else { continue };
-            let transparency = match prop(inst, "Transparency") {
-                Some(Variant::Float32(t)) => *t,
-                _ => 0.0,
-            };
-            if transparency >= 0.999 {
-                continue;
-            }
-            let size = part_size(inst).abs();
-            let shape = shape_of(inst);
-            let mesh_scale = match shape {
-                Shape::Ball => Vec3::splat(size.min_element()),
-                Shape::Cylinder => {
-                    let d = size.y.min(size.z);
-                    Vec3::new(size.x, d, d)
-                }
-                _ => size,
-            };
-            let [r, g, b] = part_color_srgb(inst);
-            parts.push(ScenePart {
-                owner: inst.referent(),
-                shape,
-                transform: cframe_to_mat4(&cf),
-                size,
-                mesh_scale,
-                color: [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0 - transparency.clamp(0.0, 1.0)],
-            });
+fn extract_parts(dom: &WeakDom, mut assets: Option<&mut AssetStore>) -> Scene {
+    let mut scene = Scene::default();
+    for inst in dom.descendants_of(world_root(dom)) {
+        if !is_renderable(inst) {
+            continue;
         }
-        Scene { parts }
+        let Some(cf) = part_cframe(inst) else { continue };
+        let transparency = match prop(inst, "Transparency") {
+            Some(Variant::Float32(t)) => *t,
+            _ => 0.0,
+        };
+        if transparency >= 0.999 {
+            continue;
+        }
+        let size = part_size(inst).abs();
+        let shape = shape_of(inst);
+        let mut mesh_scale = match shape {
+            Shape::Ball => Vec3::splat(size.min_element()),
+            Shape::Cylinder => {
+                let d = size.y.min(size.z);
+                Vec3::new(size.x, d, d)
+            }
+            _ => size,
+        };
+        let mut mesh = None;
+        if inst.class == "MeshPart"
+            && let Some(store) = assets.as_deref_mut()
+            && let Some((loaded, scale)) = mesh_for_part(inst, size, store, &mut scene.warnings)
+        {
+            mesh = Some(loaded);
+            mesh_scale = scale;
+        }
+        let [r, g, b] = part_color_srgb(inst);
+        scene.parts.push(ScenePart {
+            owner: inst.referent(),
+            shape,
+            transform: cframe_to_mat4(&cf),
+            size,
+            mesh_scale,
+            color: [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0 - transparency.clamp(0.0, 1.0)],
+            mesh,
+        });
+    }
+    scene
+}
+
+/// The value of a Content or ContentId property, if it is set.
+fn content_value(inst: &Instance, name: &str) -> Option<String> {
+    match prop(inst, name)? {
+        Variant::Content(c) => c.as_uri().filter(|u| !u.is_empty()).map(str::to_owned),
+        Variant::ContentId(id) => Some(id.as_str().to_owned()).filter(|u| !u.is_empty()),
+        _ => None,
+    }
+}
+
+/// The first of `names` that holds a local (`kahua://`) URI.
+fn local_uri(inst: &Instance, names: &[&str]) -> Option<String> {
+    names.iter().filter_map(|n| content_value(inst, n)).find(|u| asset_uri::relative_path(u).is_some())
+}
+
+/// Loads the mesh and texture of a MeshPart that refers to a local file, and
+/// the scale that fits the mesh to the part's Size. Returns `None` (the part is
+/// drawn as a box) when the mesh is not local or cannot be loaded.
+fn mesh_for_part(
+    inst: &Instance,
+    size: Vec3,
+    assets: &mut AssetStore,
+    warnings: &mut Vec<String>,
+) -> Option<(MeshRef, Vec3)> {
+    let mesh_uri = local_uri(inst, &["MeshContent", "MeshId"])?;
+    let mesh = match assets.mesh(&mesh_uri) {
+        Ok(mesh) => mesh,
+        Err(e) => {
+            warnings.push(format!("{}: {e:#}", inst.name));
+            return None;
+        }
+    };
+    let texture = local_uri(inst, &["TextureContent", "TextureID"]).and_then(|uri| match assets.image(&uri) {
+        Ok(image) => Some(image),
+        Err(e) => {
+            warnings.push(format!("{}: {e:#}", inst.name));
+            None
+        }
+    });
+    // InitialSize is the size the mesh was authored at; without it, the file's own size.
+    let initial = match prop(inst, "InitialSize") {
+        Some(Variant::Vector3(v)) if v.x > 0.0 && v.y > 0.0 && v.z > 0.0 => Vec3::new(v.x, v.y, v.z),
+        _ => mesh.native_size,
+    };
+    Some((MeshRef { mesh, texture }, mesh_scale(size, initial)))
+}
+
+impl Scene {
+    /// Extracts the parts without loading any mesh files: MeshParts are drawn as boxes.
+    pub fn extract(dom: &WeakDom) -> Self {
+        extract_parts(dom, None)
+    }
+
+    /// Extracts the parts, loading MeshParts that refer to local files
+    /// (`kahua://` URIs) through `assets`. Other MeshParts are drawn as boxes.
+    pub fn extract_with_assets(dom: &WeakDom, assets: &mut AssetStore) -> Self {
+        extract_parts(dom, Some(assets))
     }
 
     /// World-space bounds of all parts, ignoring huge ones like baseplates.
@@ -281,6 +368,67 @@ mod tests {
         let (i, t) = scene.pick(Vec3::new(0.0, 50.0, 0.0), Vec3::NEG_Y).unwrap();
         assert_eq!(dom.get_by_ref(scene.parts[i].owner).unwrap().name, "SpawnLocation");
         assert!((t - 49.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn mesh_scale_fits_the_file_to_size() {
+        let scale = mesh_scale(Vec3::new(4.0, 2.0, 1.0), Vec3::new(2.0, 2.0, 0.0));
+        // Flat axes (no extent in the file) are not scaled.
+        assert!(scale.abs_diff_eq(Vec3::new(2.0, 1.0, 1.0), 1e-6));
+    }
+
+    #[test]
+    fn mesh_parts_load_local_meshes_and_fall_back_to_boxes() {
+        let project = tempfile::tempdir().unwrap();
+        let meshes = project.path().join("assets/meshes");
+        std::fs::create_dir_all(&meshes).unwrap();
+        std::fs::write(meshes.join("quad.obj"), crate::assets::fixtures::QUAD_OBJ).unwrap();
+
+        let mut dom = kahua_io::template::empty();
+        let workspace = kahua_io::template::workspace(&dom);
+        let size = Vector3::new(4.0, 4.0, 1.0);
+        let local = kahua_io::template::mesh_part(
+            "Local",
+            "kahua://assets/meshes/quad.obj",
+            Vector3::new(2.0, 2.0, 0.0),
+            Vector3::new(0.0, 0.0, 0.0),
+        )
+        .with_property("Size", size);
+        let remote = kahua_io::template::mesh_part(
+            "Remote",
+            "rbxassetid://123",
+            Vector3::new(1.0, 1.0, 1.0),
+            Vector3::new(10.0, 0.0, 0.0),
+        );
+        let missing = kahua_io::template::mesh_part(
+            "Missing",
+            "kahua://assets/meshes/gone.obj",
+            Vector3::new(1.0, 1.0, 1.0),
+            Vector3::new(20.0, 0.0, 0.0),
+        );
+        dom.insert(workspace, local);
+        dom.insert(workspace, remote);
+        dom.insert(workspace, missing);
+
+        let plain = Scene::extract(&dom);
+        assert!(plain.parts.iter().all(|p| p.mesh.is_none()));
+
+        let mut store = AssetStore::new(project.path());
+        let scene = Scene::extract_with_assets(&dom, &mut store);
+        assert_eq!(scene.warnings.len(), 1, "{:?}", scene.warnings);
+        assert!(scene.warnings[0].contains("Missing"));
+        let by_name = |name: &str| {
+            let part = scene.parts.iter().find(|p| dom.get_by_ref(p.owner).unwrap().name == name).unwrap();
+            part.clone()
+        };
+        let local = by_name("Local");
+        let mesh = local.mesh.as_ref().expect("local mesh is loaded");
+        assert!(mesh.mesh.native_size.abs_diff_eq(Vec3::new(2.0, 2.0, 0.0), 1e-5));
+        // Size 4x4x1 over the file's 2x2 (InitialSize has no depth, so the file's own size is used).
+        assert!(local.mesh_scale.abs_diff_eq(Vec3::new(2.0, 2.0, 1.0), 1e-5));
+        assert_eq!(local.size, Vec3::new(4.0, 4.0, 1.0));
+        assert!(by_name("Remote").mesh.is_none());
+        assert!(by_name("Missing").mesh.is_none());
     }
 
     #[test]

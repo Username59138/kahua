@@ -1,6 +1,6 @@
 //! Built-in place templates.
 
-use rbx_dom_weak::types::{CFrame, Color3, Matrix3, Vector3};
+use rbx_dom_weak::types::{CFrame, Color3, Content, Matrix3, Vector3};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
 const SERVICES: &[&str] = &[
@@ -41,6 +41,19 @@ pub fn part(name: &str, class: &str, position: Vector3, size: Vector3, color: Co
         .with_property("Size", size)
         .with_property("CFrame", CFrame::new(position, Matrix3::identity()))
         .with_property("Color", color)
+}
+
+/// An anchored MeshPart showing the mesh at `mesh_uri` (a `kahua://` URI).
+/// `initial_size` is the mesh's own bounding-box size; the part starts at that
+/// size so the mesh appears unscaled.
+pub fn mesh_part(name: &str, mesh_uri: &str, initial_size: Vector3, position: Vector3) -> InstanceBuilder {
+    InstanceBuilder::new("MeshPart")
+        .with_name(name)
+        .with_property("Anchored", true)
+        .with_property("MeshContent", Content::from_uri(mesh_uri))
+        .with_property("InitialSize", initial_size)
+        .with_property("Size", initial_size)
+        .with_property("CFrame", CFrame::new(position, Matrix3::identity()))
 }
 
 /// The classic Baseplate template: a large grey plate and a spawn point.

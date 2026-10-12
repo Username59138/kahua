@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use kahua_io::rbx_dom_weak::types::{CFrame, Color3, Matrix3, Ref, Variant, Vector3};
+use kahua_io::rbx_dom_weak::Ustr;
+use kahua_io::rbx_dom_weak::types::{CFrame, Color3, Content, ContentId, Matrix3, Ref, Variant, Vector3};
 use kahua_io::rbx_dom_weak::{InstanceBuilder, WeakDom};
 use kahua_io::{CreateOptions, Project, place, reflect, template};
 
@@ -278,7 +279,7 @@ fn custom_rojo_layout_is_preserved() {
     let sign = find(&loaded.dom, &["Workspace", "Sign"]);
     let sign_inst = loaded.dom.get_by_ref(sign).unwrap();
     assert_eq!(sign_inst.class, "Part");
-    assert!(matches!(sign_inst.properties.get(&"Material".into()), Some(Variant::Enum(_))));
+    assert!(matches!(sign_inst.properties.get(&Ustr::from("Material")), Some(Variant::Enum(_))));
     let server = find(&loaded.dom, &["ServerScriptService", "Server"]);
     assert_eq!(loaded.dom.get_by_ref(server).unwrap().class, "Script");
 
@@ -309,6 +310,60 @@ fn import_place_file() {
     kahua_io::project::import(&file, &dir, "imported", &no_git()).unwrap();
     let loaded = Project::open(&dir).unwrap();
     assert_eq!(root(&place::read_file(&file).unwrap()), root(&loaded.dom));
+}
+
+#[test]
+fn mesh_parts_keep_their_kahua_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("game");
+    let mut dom = template::empty();
+    let workspace = template::workspace(&dom);
+    dom.insert(
+        workspace,
+        template::mesh_part(
+            "Sword",
+            "kahua://assets/meshes/sword.glb",
+            Vector3::new(1.0, 4.0, 0.5),
+            Vector3::new(0.0, 2.0, 0.0),
+        )
+        .with_property("TextureContent", Content::from_uri("kahua://assets/textures/wood.png")),
+    );
+    dom.insert(
+        workspace,
+        InstanceBuilder::new("MeshPart")
+            .with_name("Legacy")
+            .with_property("MeshId", ContentId::from("kahua://assets/meshes/old.obj"))
+            .with_property("TextureID", ContentId::from("kahua://assets/textures/old.png")),
+    );
+    let (_, warnings) = kahua_io::project::create_from_dom(&dir, "game", &dom, &no_git()).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let mut loaded = Project::open(&dir).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(root(&dom), root(&loaded.dom));
+
+    let sword = find(&loaded.dom, &["Workspace", "Sword"]);
+    let props = &loaded.dom.get_by_ref(sword).unwrap().properties;
+    assert_eq!(
+        props.get(&Ustr::from("MeshContent")),
+        Some(&Variant::Content(Content::from_uri("kahua://assets/meshes/sword.glb")))
+    );
+    assert_eq!(
+        props.get(&Ustr::from("TextureContent")),
+        Some(&Variant::Content(Content::from_uri("kahua://assets/textures/wood.png")))
+    );
+    assert_eq!(props.get(&Ustr::from("InitialSize")), Some(&Variant::Vector3(Vector3::new(1.0, 4.0, 0.5))));
+
+    // Saving again writes the same thing, and the legacy ContentId properties survive too.
+    loaded.project.save(&loaded.dom).unwrap();
+    let reopened = Project::open(&dir).unwrap();
+    assert_eq!(root(&loaded.dom), root(&reopened.dom));
+    let legacy = find(&reopened.dom, &["Workspace", "Legacy"]);
+    let legacy_props = &reopened.dom.get_by_ref(legacy).unwrap().properties;
+    assert_eq!(
+        legacy_props.get(&Ustr::from("MeshId")),
+        Some(&Variant::ContentId(ContentId::from("kahua://assets/meshes/old.obj")))
+    );
 }
 
 fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
